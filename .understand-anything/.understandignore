@@ -1,0 +1,202 @@
+.understandignore - patterns for files/dirs to exclude from analysis
+Syntax: same as .gitignore (globs, # comments, ! negation, trailing / for dirs)
+Lines below are suggestions - uncomment to activate.
+Use ! prefix to force-include something excluded by defaults.
+
+Built-in defaults (always excluded unless negated):
+  node_modules/, .git/, dist/, build/, obj/, *.lock, *.min.js, etc.
+
+--- From .gitignore (uncomment to exclude) ---
+
+.worktrees/
+.worktree/
+.assets
+.docs
+.env
+.web
+.orion
+nanobot-desktop/
+desktop/
+docs/superpowers/
+docs/plans/
+webui/node_modules/
+webui/dist/
+webui/coverage/
+webui/.vite/
+*.tsbuildinfo
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.dmypy.json
+dmypy.json
+.tox/
+.nox/
+.hypothesis/
+*.manifest
+*.spec
+pip-wheel-metadata/
+share/python-wheels/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+poetry.lock
+uv.lock
+.ipynb_checkpoints/
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.directory
+.cursor/
+.fleet/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+nano.*.save
+.env.*
+!.env.example
+logs/
+tmp/
+temp/
+*.tmp
+exp/
+.playwright-mcp/
+
+--- Detected directories (uncomment to exclude) ---
+
+tests/
+docs/
+
+--- Test file patterns (uncomment to exclude) ---
+
+*.test.*
+*.spec.*
+*.snap
+
+.playwright-mcp/
+.trae/
+.omc/
+.github/
+tests/
+# Project-specific
+.worktrees/
+.worktree/
+.assets
+.docs
+.env
+.web
+.orion
+nanobot-desktop/
+desktop/
+
+# Claude / AI assistant artifacts
+docs/superpowers/
+docs/plans/
+
+# webui (monorepo frontend)
+webui/node_modules/
+webui/dist/
+webui/coverage/
+webui/.vite/
+*.tsbuildinfo
+
+# Python bytecode & caches
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+__pycache__/
+*.egg-info/
+*.egg
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.dmypy.json
+dmypy.json
+.tox/
+.nox/
+.hypothesis/
+
+# Build & packaging
+dist/
+build/
+*.manifest
+*.spec
+pip-wheel-metadata/
+share/python-wheels/
+
+# Test & coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# Lock files (project policy)
+poetry.lock
+uv.lock
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+.directory
+
+# Editors & IDEs (local workspace / user settings)
+.vscode/
+.cursor/
+.idea/
+.fleet/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+nano.*.save
+
+# Environment & secrets (keep examples tracked if needed)
+.env.*
+!.env.example
+
+# Logs & temp
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+exp/
+.playwright-mcp/
+.trae/
+.omc/
+.github/
+tests/
