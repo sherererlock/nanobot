@@ -29,8 +29,10 @@ Use these when you want deeper customization, integration, or extension details.
 | Topic | Repo docs | What it covers |
 |---|---|---|
 | Memory | [`memory.md`](./memory.md) | How nanobot stores, consolidates, and restores memory |
+| Agent loop | [`agent-loop.md`](./agent-loop.md) | How one turn moves through observe, think, act, and state update |
+| Tool system | [`tool-system.md`](./tool-system.md) | How tools are defined, registered, executed, and fed back into the loop |
+| Context system | [`context-system.md`](./context-system.md) | How nanobot assembles, governs, restores, and persists runtime context |
 | Python SDK | [`python-sdk.md`](./python-sdk.md) | Use nanobot programmatically from Python |
 | Channel plugin guide | [`channel-plugin-guide.md`](./channel-plugin-guide.md) | Build and test custom chat channel plugins |
 | WebSocket channel | [`websocket.md`](./websocket.md) | Real-time WebSocket access and protocol details |
 | Custom tools | [`my-tool.md`](./my-tool.md) | Inspect and tune runtime state with the `my` tool |
-
