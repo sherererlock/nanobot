@@ -28,6 +28,7 @@ Use these when you want deeper customization, integration, or extension details.
 
 | Topic | Repo docs | What it covers |
 |---|---|---|
+| Development | [`development.md`](./development.md) | Contributor notes for adding providers and transcription adapters |
 | Memory | [`memory.md`](./memory.md) | How nanobot stores, consolidates, and restores memory |
 | Agent loop | [`agent-loop.md`](./agent-loop.md) | How one turn moves through observe, think, act, and state update |
 | Tool system | [`tool-system.md`](./tool-system.md) | How tools are defined, registered, executed, and fed back into the loop |
