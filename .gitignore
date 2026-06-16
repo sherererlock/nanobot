@@ -106,3 +106,6 @@ temp/
 *.tmp
 exp/
 .playwright-mcp/
+*.bat
+*.ps1
+.gitignore

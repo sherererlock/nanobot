@@ -577,6 +577,11 @@ Give nanobot its own email account. It polls **IMAP** for incoming mail and repl
 > - `allowFrom`: Add your email address. Use `["*"]` to accept emails from anyone.
 > - `smtpUseTls` and `smtpUseSsl` default to `true` / `false` respectively, which is correct for Gmail (port 587 + STARTTLS). No need to set them explicitly.
 > - Set `"autoReplyEnabled": false` if you only want to read/analyze emails without sending automatic replies.
+> - `postAction`: Optional post-processing for processed emails: `"delete"` or `"move"` (default `null`).
+>   This runs only after an accepted email is successfully delivered to the AI pipeline.
+> - `postActionMoveMailbox`: Destination mailbox used when `postAction` is `"move"` (for example `"Processed"` or `"[Gmail]/Trash"`).
+> - `postActionIgnoreSkipped`: If `true` (default), skipped emails are ignored for post-action and not moved/deleted.
+> - `postActionExpunge`: When `true`, the channel allows a full-mailbox `EXPUNGE` fallback if UID-scoped expunge is unavailable or fails (default `false`). Enable only on very old IMAP servers that lack modern UIDPLUS support. Note that this fallback will expunge **all** messages marked as deleted in the mailbox, including ones not handled by the agent. Leaving this off is safe for all modern IMAP servers.
 > - `allowedAttachmentTypes`: Save inbound attachments matching these MIME types — `["*"]` for all, e.g. `["application/pdf", "image/*"]` (default `[]` = disabled).
 > - `maxAttachmentSize`: Max size per attachment in bytes (default `2000000` / 2MB).
 > - `maxAttachmentsPerEmail`: Max attachments to save per email (default `5`).
@@ -597,6 +602,10 @@ Give nanobot its own email account. It polls **IMAP** for incoming mail and repl
       "smtpPassword": "your-app-password",
       "fromAddress": "my-nanobot@gmail.com",
       "allowFrom": ["your-real-email@gmail.com"],
+      "postAction": "move",
+      "postActionMoveMailbox": "[Gmail]/Trash",
+      "postActionIgnoreSkipped": true,
+      "postActionExpunge": false,
       "allowedAttachmentTypes": ["application/pdf", "image/*"]
     }
   }
