@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
@@ -14,7 +15,33 @@ from typing import Any
 import json_repair
 from loguru import logger
 
-from nanobot.utils.helpers import image_placeholder_text
+STREAM_IDLE_TIMEOUT_ENV = "NANOBOT_STREAM_IDLE_TIMEOUT_S"
+DEFAULT_STREAM_IDLE_TIMEOUT_S = 90.0
+MAX_STREAM_IDLE_TIMEOUT_S = 3600.0
+
+
+def resolve_stream_idle_timeout_s(
+    *,
+    env_value: str | None = None,
+    default: float = DEFAULT_STREAM_IDLE_TIMEOUT_S,
+    maximum: float = MAX_STREAM_IDLE_TIMEOUT_S,
+) -> float:
+    """Return a safe streaming idle timeout from env/config text."""
+    raw = os.environ.get(STREAM_IDLE_TIMEOUT_ENV) if env_value is None else env_value
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid {}={!r}; using {}", STREAM_IDLE_TIMEOUT_ENV, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("Ignoring non-positive {}={!r}; using {}", STREAM_IDLE_TIMEOUT_ENV, raw, default)
+        return default
+    if value > maximum:
+        logger.warning("Clamping {}={!r} to {}", STREAM_IDLE_TIMEOUT_ENV, raw, maximum)
+        return maximum
+    return value
 
 
 @dataclass
@@ -26,6 +53,18 @@ class ToolCallRequest:
     extra_content: dict[str, Any] | None = None
     provider_specific_fields: dict[str, Any] | None = None
     function_provider_specific_fields: dict[str, Any] | None = None
+
+    def has_valid_name(self) -> bool:
+        """Whether this call carries a usable (non-empty string) tool name.
+
+        ToolCallRequest.name is typed ``str`` but not enforced at runtime: a
+        model/gateway can emit a degenerate call with ``name=None`` or ``""``.
+        Such a call cannot be executed and, if persisted and replayed, makes
+        upstream APIs reject the whole request (e.g. Anthropic-style
+        ``messages.content.N.tool_use.name: Input should be a valid string``),
+        which permanently wedges the session.
+        """
+        return isinstance(self.name, str) and bool(self.name)
 
     def to_openai_tool_call(self) -> dict[str, Any]:
         """Serialize to an OpenAI-style tool_call payload."""
@@ -235,7 +274,8 @@ class LLMProvider(ABC):
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Sanitize message content: fix empty blocks, strip internal _meta fields."""
         result: list[dict[str, Any]] = []
-        for msg in messages:
+        for raw_msg in messages:
+            msg = {key: value for key, value in raw_msg.items() if key != "_meta"}
             content = msg.get("content")
 
             if isinstance(content, str) and not content:
@@ -535,8 +575,10 @@ class LLMProvider(ABC):
                 new_content = []
                 for b in content:
                     if isinstance(b, dict) and b.get("type") == "image_url":
-                        path = (b.get("_meta") or {}).get("path", "")
-                        placeholder = image_placeholder_text(path, empty="[image omitted]")
+                        placeholder = (
+                            "[Image not delivered to model — "
+                            "do not describe or reference it]"
+                        )
                         new_content.append({"type": "text", "text": placeholder})
                         found = True
                     else:
@@ -560,8 +602,10 @@ class LLMProvider(ABC):
             if isinstance(content, list):
                 for i, b in enumerate(content):
                     if isinstance(b, dict) and b.get("type") == "image_url":
-                        path = (b.get("_meta") or {}).get("path", "")
-                        placeholder = image_placeholder_text(path, empty="[image omitted]")
+                        placeholder = (
+                            "[Image not delivered to model — "
+                            "do not describe or reference it]"
+                        )
                         content[i] = {"type": "text", "text": placeholder}
                         found = True
         return found
@@ -631,6 +675,7 @@ class LLMProvider(ABC):
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        on_stream_recover: Callable[[], Awaitable[None]] | None = None,
         retry_mode: str = "standard",
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
@@ -651,6 +696,12 @@ class LLMProvider(ABC):
             if on_content_delta:
                 await on_content_delta(text)
 
+        async def _recover_stream() -> None:
+            nonlocal has_streamed_content
+            if on_stream_recover:
+                await on_stream_recover()
+            has_streamed_content = False
+
         kw: dict[str, Any] = dict(
             messages=messages, tools=tools, model=model,
             max_tokens=max_tokens, temperature=temperature,
@@ -659,6 +710,8 @@ class LLMProvider(ABC):
             on_thinking_delta=on_thinking_delta,
             on_tool_call_delta=on_tool_call_delta,
         )
+        if on_stream_recover and getattr(self, "supports_stream_recover_callback", False):
+            kw["on_stream_recover"] = _recover_stream
         return await self._run_with_retry(
             self._safe_chat_stream,
             kw,
@@ -666,6 +719,7 @@ class LLMProvider(ABC):
             retry_mode=retry_mode,
             on_retry_wait=on_retry_wait,
             should_retry_guard=lambda: not has_streamed_content,
+            on_stream_recover=_recover_stream if on_stream_recover else None,
         )
 
     async def chat_with_retry(
@@ -813,6 +867,7 @@ class LLMProvider(ABC):
         retry_mode: str,
         on_retry_wait: Callable[[str], Awaitable[None]] | None,
         should_retry_guard: Callable[[], bool] | None = None,
+        on_stream_recover: Callable[[], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         attempt = 0
         delays = list(self._CHAT_RETRY_DELAYS)
@@ -827,10 +882,29 @@ class LLMProvider(ABC):
                 return response
             last_response = response
             if should_retry_guard is not None and not should_retry_guard():
-                logger.warning(
-                    "LLM stream failed after content was emitted; skipping retry"
-                )
-                return response
+                is_timeout = (response.error_kind or "").lower() == "timeout"
+                if is_timeout:
+                    if on_stream_recover:
+                        logger.warning(
+                            "LLM stream stalled after content was emitted; "
+                            "starting a new stream segment and retrying"
+                        )
+                        await on_stream_recover()
+                    else:
+                        logger.warning(
+                            "LLM stream stalled after content was emitted; "
+                            "suppressing delta callbacks and retrying"
+                        )
+                        kw.setdefault("on_content_delta", None)
+                        kw["on_content_delta"] = None
+                        kw["on_thinking_delta"] = None
+                        kw["on_tool_call_delta"] = None
+                        should_retry_guard = None
+                else:
+                    logger.warning(
+                        "LLM stream failed after content was emitted; skipping retry"
+                    )
+                    return response
             error_key = ((response.content or "").strip().lower() or None)
             if error_key and error_key == last_error_key:
                 identical_error_count += 1

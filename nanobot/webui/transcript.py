@@ -2,25 +2,37 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import re
+import shutil
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, NamedTuple
 from urllib.parse import unquote, urlparse
 
 from loguru import logger
 
 from nanobot.config.paths import get_webui_dir
+from nanobot.runtime_context import public_history_message
+from nanobot.session.automation_turns import is_automation_kind
+from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.session.manager import SessionManager
+from nanobot.webui.metadata import WEBUI_MESSAGE_SOURCE_METADATA_KEY, WEBUI_TURN_METADATA_KEY
 
 WEBUI_TRANSCRIPT_SCHEMA_VERSION = 3
+WEBUI_FORK_MARKER_EVENT = "fork_marker"
 _MAX_TRANSCRIPT_FILE_BYTES = 8 * 1024 * 1024
+_TARGET_ACTIVE_TRANSCRIPT_BYTES = _MAX_TRANSCRIPT_FILE_BYTES // 2
+_TRANSCRIPT_SEGMENT_MANIFEST_VERSION = 2
+_TRANSCRIPT_ACTIVE_CHUNK_ID = "active"
+_TRANSCRIPT_SEGMENT_RE = re.compile(r"^\d{6}\.jsonl$")
+_DEFAULT_TRANSCRIPT_PAGE_LIMIT = 160
+_MAX_TRANSCRIPT_PAGE_LIMIT = 1000
 _WEBUI_TURN_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
-WEBUI_TURN_METADATA_KEY = "webui_turn_id"
-WEBUI_MESSAGE_SOURCE_METADATA_KEY = "_webui_message_source"
 _MARKDOWN_LOCAL_IMAGE_RE = re.compile(
     r"!\[([^\]]*)\]\((<[^>]+>|[^)\s]+)(\s+(?:\"[^\"]*\"|'[^']*'))?\)"
 )
@@ -113,14 +125,37 @@ def webui_transcript_path(session_key: str) -> Path:
     return get_webui_dir() / f"{stem}.jsonl"
 
 
-def read_transcript_lines(session_key: str) -> list[dict[str, Any]]:
-    path = webui_transcript_path(session_key)
-    if not path.is_file():
-        return []
-    size = path.stat().st_size
-    if size > _MAX_TRANSCRIPT_FILE_BYTES:
-        logger.warning("webui transcript too large, skipping: {}", path)
-        return []
+def webui_transcript_segments_dir(session_key: str) -> Path:
+    stem = SessionManager.safe_key(session_key)
+    return get_webui_dir() / f"{stem}.segments"
+
+
+def _webui_transcript_manifest_path(session_key: str) -> Path:
+    return webui_transcript_segments_dir(session_key) / "manifest.json"
+
+
+def _legacy_webui_thread_path(session_key: str) -> Path:
+    stem = SessionManager.safe_key(session_key)
+    return get_webui_dir() / f"{stem}.json"
+
+
+class _TranscriptTurnRef(NamedTuple):
+    ordinal: int
+    records: list[dict[str, Any]]
+
+
+class _TranscriptChunkRef(NamedTuple):
+    chunk_id: str
+    start_ordinal: int
+    turn_count: int
+    user_count: int
+
+
+def _record_json_line(record: dict[str, Any]) -> str:
+    return json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+
+
+def _read_transcript_file(path: Path) -> list[dict[str, Any]]:
     lines_out: list[dict[str, Any]] = []
     try:
         with open(path, encoding="utf-8") as f:
@@ -141,8 +176,402 @@ def read_transcript_lines(session_key: str) -> list[dict[str, Any]]:
     return lines_out
 
 
-def append_transcript_object(session_key: str, obj: dict[str, Any]) -> None:
-    raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+def _records_bytes(records: list[dict[str, Any]]) -> int:
+    total = 0
+    for record in records:
+        total += len(_record_json_line(record).encode("utf-8")) + 1
+    return total
+
+
+def _flatten_turns(turns: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    return [record for turn in turns for record in turn]
+
+
+def _write_records_to_path(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for row in rows:
+                raw = _record_json_line(row)
+                if len(raw.encode("utf-8")) > _MAX_TRANSCRIPT_FILE_BYTES:
+                    raise ValueError("webui transcript line too large")
+                f.write(raw + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _segment_file_path(session_key: str, segment_id: str) -> Path:
+    return webui_transcript_segments_dir(session_key) / f"{segment_id}.jsonl"
+
+
+def _segment_ids_on_disk(session_key: str) -> list[str]:
+    directory = webui_transcript_segments_dir(session_key)
+    if not directory.is_dir():
+        return []
+    return sorted(
+        path.stem
+        for path in directory.iterdir()
+        if path.is_file() and _TRANSCRIPT_SEGMENT_RE.fullmatch(path.name)
+    )
+
+
+def _segment_manifest_entry(session_key: str, segment_id: str) -> dict[str, Any]:
+    path = _segment_file_path(session_key, segment_id)
+    lines = _read_transcript_file(path)
+    return {
+        "id": segment_id,
+        "bytes": path.stat().st_size if path.exists() else 0,
+        "turn_count": len(_split_transcript_turns(lines)),
+        "user_count": sum(1 for line in lines if _is_user_transcript_row(line)),
+    }
+
+
+def _non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _normalize_manifest_entry(session_key: str, entry: Any) -> dict[str, Any] | None:
+    if not isinstance(entry, dict):
+        return None
+    segment_id = entry.get("id")
+    if not isinstance(segment_id, str) or not _TRANSCRIPT_SEGMENT_RE.fullmatch(f"{segment_id}.jsonl"):
+        return None
+    segment_path = _segment_file_path(session_key, segment_id)
+    values = {
+        key: _non_negative_int(entry.get(key))
+        for key in ("bytes", "turn_count", "user_count")
+    }
+    if not segment_path.is_file() or values["bytes"] != segment_path.stat().st_size:
+        return None
+    if values["turn_count"] is None or values["user_count"] is None:
+        return None
+    return {
+        "id": segment_id,
+        "bytes": values["bytes"],
+        "turn_count": values["turn_count"],
+        "user_count": values["user_count"],
+    }
+
+
+def _write_segment_manifest(session_key: str, segment_ids: list[str]) -> None:
+    directory = webui_transcript_segments_dir(session_key)
+    directory.mkdir(parents=True, exist_ok=True)
+    data = {
+        "version": _TRANSCRIPT_SEGMENT_MANIFEST_VERSION,
+        "segments": [_segment_manifest_entry(session_key, segment_id) for segment_id in segment_ids],
+    }
+    path = _webui_transcript_manifest_path(session_key)
+    tmp_path = path.with_suffix(".json.tmp")
+    try:
+        tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _rebuild_segment_manifest(session_key: str) -> list[str]:
+    segment_ids = _segment_ids_on_disk(session_key)
+    if segment_ids:
+        _write_segment_manifest(session_key, segment_ids)
+    else:
+        _webui_transcript_manifest_path(session_key).unlink(missing_ok=True)
+    return segment_ids
+
+
+def _rebuilt_segment_manifest_entries(session_key: str) -> list[dict[str, Any]]:
+    return [_segment_manifest_entry(session_key, segment_id) for segment_id in _rebuild_segment_manifest(session_key)]
+
+
+def _read_segment_manifest_entries(session_key: str) -> list[dict[str, Any]]:
+    directory = webui_transcript_segments_dir(session_key)
+    if not directory.is_dir():
+        return []
+    path = _webui_transcript_manifest_path(session_key)
+    if not path.is_file():
+        return _rebuilt_segment_manifest_entries(session_key)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        raw_segments = data.get("segments") if isinstance(data, dict) else None
+        if data.get("version") != _TRANSCRIPT_SEGMENT_MANIFEST_VERSION or not isinstance(raw_segments, list):
+            return _rebuilt_segment_manifest_entries(session_key)
+        entries: list[dict[str, Any]] = []
+        for entry in raw_segments:
+            normalized = _normalize_manifest_entry(session_key, entry)
+            if normalized is None:
+                return _rebuilt_segment_manifest_entries(session_key)
+            entries.append(normalized)
+        if [entry["id"] for entry in entries] != _segment_ids_on_disk(session_key):
+            return _rebuilt_segment_manifest_entries(session_key)
+        return entries
+    except (OSError, json.JSONDecodeError, TypeError, AttributeError):
+        return _rebuilt_segment_manifest_entries(session_key)
+
+
+def _read_segment_ids(session_key: str) -> list[str]:
+    return [entry["id"] for entry in _read_segment_manifest_entries(session_key)]
+
+
+def _append_segment_turns(session_key: str, turns: list[list[dict[str, Any]]]) -> None:
+    if not turns:
+        return
+    segment_ids = _read_segment_ids(session_key)
+    next_id = int(segment_ids[-1]) + 1 if segment_ids else 1
+    batch: list[list[dict[str, Any]]] = []
+    batch_bytes = 0
+    for turn in turns:
+        turn_bytes = _records_bytes(turn)
+        if batch and batch_bytes + turn_bytes > _MAX_TRANSCRIPT_FILE_BYTES:
+            segment_id = f"{next_id:06d}"
+            _write_records_to_path(_segment_file_path(session_key, segment_id), _flatten_turns(batch))
+            segment_ids.append(segment_id)
+            next_id += 1
+            batch = []
+            batch_bytes = 0
+        batch.append(turn)
+        batch_bytes += turn_bytes
+    if batch:
+        segment_id = f"{next_id:06d}"
+        _write_records_to_path(_segment_file_path(session_key, segment_id), _flatten_turns(batch))
+        segment_ids.append(segment_id)
+    _write_segment_manifest(session_key, segment_ids)
+
+
+def _rotate_active_transcript_if_needed(session_key: str) -> None:
+    path = webui_transcript_path(session_key)
+    if not path.is_file():
+        return
+    try:
+        if path.stat().st_size <= _MAX_TRANSCRIPT_FILE_BYTES:
+            return
+    except OSError:
+        return
+
+    lines = _read_transcript_file(path)
+    if not lines:
+        return
+    turns = _split_transcript_turns(lines)
+    if len(turns) <= 1:
+        return
+
+    keep_start = len(turns) - 1
+    keep_bytes = 0
+    for idx in range(len(turns) - 1, -1, -1):
+        turn_bytes = _records_bytes(turns[idx])
+        if idx == len(turns) - 1 or keep_bytes + turn_bytes <= _TARGET_ACTIVE_TRANSCRIPT_BYTES:
+            keep_start = idx
+            keep_bytes += turn_bytes
+            continue
+        break
+
+    moved = turns[:keep_start]
+    kept = turns[keep_start:]
+    if not moved:
+        return
+    _append_segment_turns(session_key, moved)
+    _write_records_to_path(path, _flatten_turns(kept))
+
+
+def _chunk_ids(session_key: str) -> list[str]:
+    _rotate_active_transcript_if_needed(session_key)
+    ids = _read_segment_ids(session_key)
+    if webui_transcript_path(session_key).is_file():
+        ids.append(_TRANSCRIPT_ACTIVE_CHUNK_ID)
+    return ids
+
+
+def _read_chunk_turns(session_key: str, chunk_id: str) -> list[list[dict[str, Any]]]:
+    if chunk_id == _TRANSCRIPT_ACTIVE_CHUNK_ID:
+        path = webui_transcript_path(session_key)
+    else:
+        path = _segment_file_path(session_key, chunk_id)
+    if not path.is_file():
+        return []
+    return _split_transcript_turns(_read_transcript_file(path))
+
+
+def _encode_page_cursor(before_turn_ordinal: int) -> str:
+    raw = json.dumps(
+        {"before_turn": before_turn_ordinal},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_page_cursor(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        data = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+    except (binascii.Error, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    before_turn = data.get("before_turn")
+    if (
+        isinstance(before_turn, bool)
+        or not isinstance(before_turn, int)
+        or before_turn < 0
+    ):
+        return None
+    return before_turn
+
+
+def _coerce_page_limit(limit: int | None) -> int:
+    if limit is None:
+        return _DEFAULT_TRANSCRIPT_PAGE_LIMIT
+    return max(1, min(_MAX_TRANSCRIPT_PAGE_LIMIT, int(limit)))
+
+
+def _chunk_turn_refs(session_key: str) -> list[_TranscriptChunkRef]:
+    _rotate_active_transcript_if_needed(session_key)
+    refs: list[_TranscriptChunkRef] = []
+    ordinal = 0
+    for entry in _read_segment_manifest_entries(session_key):
+        chunk_id = str(entry["id"])
+        turn_count = int(entry["turn_count"])
+        if turn_count <= 0:
+            continue
+        refs.append(_TranscriptChunkRef(chunk_id, ordinal, turn_count, int(entry["user_count"])))
+        ordinal += turn_count
+    if webui_transcript_path(session_key).is_file():
+        active_turns = _read_chunk_turns(session_key, _TRANSCRIPT_ACTIVE_CHUNK_ID)
+        active_turn_count = len(active_turns)
+        if active_turn_count > 0:
+            refs.append(
+                _TranscriptChunkRef(
+                    _TRANSCRIPT_ACTIVE_CHUNK_ID,
+                    ordinal,
+                    active_turn_count,
+                    sum(1 for turn in active_turns for row in turn if _is_user_transcript_row(row)),
+                ),
+            )
+    return refs
+
+
+def _count_user_messages_before_ordinal(
+    session_key: str,
+    chunks: list[_TranscriptChunkRef],
+    before_ordinal: int,
+) -> int:
+    total = 0
+    for chunk in chunks:
+        if before_ordinal <= chunk.start_ordinal:
+            break
+        local_end = min(chunk.turn_count, before_ordinal - chunk.start_ordinal)
+        if local_end <= 0:
+            continue
+        if local_end >= chunk.turn_count:
+            total += chunk.user_count
+            continue
+        turns = _read_chunk_turns(session_key, chunk.chunk_id)
+        total += sum(
+            1
+            for turn in turns[:local_end]
+            for row in turn
+            if _is_user_transcript_row(row)
+        )
+    return total
+
+
+def _select_transcript_page(
+    session_key: str,
+    *,
+    limit: int | None,
+    before: str | None,
+    _manifest_rebuilt: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    page_limit = _coerce_page_limit(limit)
+    chunks = _chunk_turn_refs(session_key)
+    total_turns = sum(chunk.turn_count for chunk in chunks)
+    before_ordinal = _decode_page_cursor(before)
+    upper_ordinal = total_turns if before_ordinal is None else min(before_ordinal, total_turns)
+    selected: list[_TranscriptTurnRef] = []
+    selected_message_count = 0
+
+    for chunk in reversed(chunks):
+        if chunk.start_ordinal >= upper_ordinal:
+            continue
+        local_upper = min(chunk.turn_count, upper_ordinal - chunk.start_ordinal)
+        if local_upper <= 0:
+            continue
+        turns = _read_chunk_turns(session_key, chunk.chunk_id)
+        if (
+            chunk.chunk_id != _TRANSCRIPT_ACTIVE_CHUNK_ID
+            and len(turns) != chunk.turn_count
+            and not _manifest_rebuilt
+        ):
+            _rebuild_segment_manifest(session_key)
+            return _select_transcript_page(
+                session_key,
+                limit=limit,
+                before=before,
+                _manifest_rebuilt=True,
+            )
+        local_upper = min(local_upper, len(turns))
+        for turn_index in range(local_upper - 1, -1, -1):
+            ordinal = chunk.start_ordinal + turn_index
+            turn = turns[turn_index]
+            selected.append(_TranscriptTurnRef(ordinal, turn))
+            selected_message_count += len(replay_transcript_to_ui_messages(turn))
+            if selected_message_count >= page_limit:
+                break
+        if selected_message_count >= page_limit:
+            break
+
+    selected_chronological = list(reversed(selected))
+    lines = [record for ref in selected_chronological for record in ref.records]
+    if not selected_chronological:
+        return [], {
+            "before_cursor": None,
+            "has_more_before": False,
+            "loaded_message_count": 0,
+            "user_message_offset": 0,
+        }
+
+    first_ref = selected_chronological[0]
+    has_more = first_ref.ordinal > 0
+    page = {
+        "before_cursor": _encode_page_cursor(first_ref.ordinal) if has_more else None,
+        "has_more_before": has_more,
+        "loaded_message_count": 0,
+        "user_message_offset": _count_user_messages_before_ordinal(
+            session_key,
+            chunks,
+            first_ref.ordinal,
+        ),
+    }
+    return lines, page
+
+
+def read_transcript_lines(session_key: str) -> list[dict[str, Any]]:
+    lines: list[dict[str, Any]] = []
+    for chunk_id in _chunk_ids(session_key):
+        if chunk_id == _TRANSCRIPT_ACTIVE_CHUNK_ID:
+            lines.extend(_read_transcript_file(webui_transcript_path(session_key)))
+        else:
+            lines.extend(_read_transcript_file(_segment_file_path(session_key, chunk_id)))
+    return lines
+
+
+def _write_transcript_lines(session_key: str, rows: list[dict[str, Any]]) -> None:
+    delete_webui_transcript(session_key)
+    path = webui_transcript_path(session_key)
+    _write_records_to_path(path, rows)
+    _rotate_active_transcript_if_needed(session_key)
+
+
+def _append_to_active_transcript(session_key: str, obj: dict[str, Any]) -> None:
+    raw = _record_json_line(obj)
     if len(raw.encode("utf-8")) > _MAX_TRANSCRIPT_FILE_BYTES:
         msg = "webui transcript line too large"
         raise ValueError(msg)
@@ -155,6 +584,12 @@ def append_transcript_object(session_key: str, obj: dict[str, Any]) -> None:
         os.fsync(f.fileno())
 
 
+def append_transcript_object(session_key: str, obj: dict[str, Any]) -> None:
+    _append_to_active_transcript(session_key, obj)
+    if obj.get("event") == "turn_end":
+        _rotate_active_transcript_if_needed(session_key)
+
+
 def normalize_webui_turn_id(value: Any) -> str:
     if isinstance(value, str):
         candidate = value.strip()
@@ -165,9 +600,12 @@ def normalize_webui_turn_id(value: Any) -> str:
 
 def webui_message_source(metadata: dict[str, Any] | None) -> dict[str, str] | None:
     raw = (metadata or {}).get(WEBUI_MESSAGE_SOURCE_METADATA_KEY)
-    if not isinstance(raw, dict) or raw.get("kind") != "cron":
+    if not isinstance(raw, dict):
         return None
-    source: dict[str, str] = {"kind": "cron"}
+    kind = raw.get("kind")
+    if not is_automation_kind(kind):
+        return None
+    source: dict[str, str] = {"kind": kind}
     label = raw.get("label")
     if isinstance(label, str) and label.strip():
         source["label"] = label.strip()
@@ -274,16 +712,122 @@ class WebUITranscriptRecorder:
             self._turn_sequences.pop((chat_id, turn_id), None)
 
 
+def _chat_id_from_session_key(session_key: str) -> str | None:
+    if not session_key.startswith("websocket:"):
+        return None
+    chat_id = session_key.split(":", 1)[1].strip()
+    return chat_id or None
+
+
+def _is_user_transcript_row(row: dict[str, Any]) -> bool:
+    return row.get("event") == "user" or row.get("role") == "user"
+
+
+def fork_transcript_before_user_index(
+    source_key: str,
+    target_key: str,
+    before_user_index: int,
+) -> bool:
+    """Copy transcript rows before a zero-based global user-message index.
+
+    ``before_user_index == user_count`` copies the full transcript prefix. WebUI
+    uses that when forking from an assistant reply at the end of a chat.
+    """
+    if before_user_index < 0:
+        return False
+    lines = read_transcript_lines(source_key)
+    if not lines:
+        return False
+
+    target_chat_id = _chat_id_from_session_key(target_key)
+    copied: list[dict[str, Any]] = []
+    user_index = 0
+    found_target = False
+    for row in lines:
+        if row.get("event") == WEBUI_FORK_MARKER_EVENT:
+            continue
+        if _is_user_transcript_row(row):
+            if user_index == before_user_index:
+                found_target = True
+                break
+            user_index += 1
+        dup = json.loads(json.dumps(row, ensure_ascii=False))
+        if target_chat_id is not None:
+            dup["chat_id"] = target_chat_id
+        copied.append(dup)
+    if user_index == before_user_index:
+        found_target = True
+
+    if not found_target:
+        return False
+
+    _write_transcript_lines(target_key, copied)
+    return True
+
+
+def append_fork_marker(session_key: str) -> None:
+    """Mark the UI-only boundary where a WebUI fork starts accepting new turns."""
+    append_transcript_object(
+        session_key,
+        {
+            "event": WEBUI_FORK_MARKER_EVENT,
+            "chat_id": _chat_id_from_session_key(session_key),
+        },
+    )
+
+
+def write_session_messages_as_transcript(
+    target_key: str,
+    messages: list[dict[str, Any]],
+) -> None:
+    """Write a minimal WebUI transcript from already-truncated session messages."""
+    target_chat_id = _chat_id_from_session_key(target_key)
+    rows: list[dict[str, Any]] = []
+    for msg in messages:
+        if is_hidden_history_message(msg):
+            continue
+        msg = public_history_message(msg)
+        role = msg.get("role")
+        content = msg.get("content")
+        text = content if isinstance(content, str) else ""
+        if role == "user":
+            row: dict[str, Any] = {"event": "user", "chat_id": target_chat_id, "text": text}
+            media = msg.get("media")
+            if isinstance(media, list) and media:
+                row["media_paths"] = [str(p) for p in media if isinstance(p, str) and p]
+            for key in ("cli_apps", "mcp_presets"):
+                value = msg.get(key)
+                if isinstance(value, list) and value:
+                    row[key] = json.loads(json.dumps(value, ensure_ascii=False))
+        elif role == "assistant" and text.strip():
+            row = {"event": "message", "chat_id": target_chat_id, "text": text}
+            media = msg.get("media")
+            if isinstance(media, list) and media:
+                row["media"] = [str(p) for p in media if isinstance(p, str) and p]
+        else:
+            continue
+        rows.append(row)
+    _write_transcript_lines(target_key, rows)
+
+
 def delete_webui_transcript(session_key: str) -> bool:
-    path = webui_transcript_path(session_key)
-    if not path.is_file():
-        return False
-    try:
-        path.unlink()
-        return True
-    except OSError as e:
-        logger.warning("Failed to delete webui transcript {}: {}", path, e)
-        return False
+    removed = False
+    for path in (webui_transcript_path(session_key), _legacy_webui_thread_path(session_key)):
+        if not path.is_file():
+            continue
+        try:
+            path.unlink()
+            removed = True
+        except OSError as e:
+            logger.warning("Failed to delete webui transcript {}: {}", path, e)
+    segments_dir = webui_transcript_segments_dir(session_key)
+    if segments_dir.is_dir():
+        try:
+            shutil.rmtree(segments_dir)
+            removed = True
+        except OSError as e:
+            logger.warning("Failed to delete webui transcript segments {}: {}", segments_dir, e)
+    return removed
 
 
 def build_user_transcript_event(
@@ -313,11 +857,29 @@ def build_user_transcript_event(
     return event
 
 
+def _is_legacy_raw_subagent_result(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    if not isinstance(content, str):
+        return False
+    text = content.replace("\r\n", "\n").strip()
+    return (
+        text.startswith("[Subagent '")
+        and "\n\nTask:" in text
+        and "\n\nResult:" in text
+        and "Summarize this naturally" in text
+    )
+
+
 def _session_user_event(
     session_key: str,
     message: dict[str, Any],
 ) -> dict[str, Any] | None:
     if message.get("role") != "user":
+        return None
+    if is_hidden_history_message(message):
+        return None
+    message = public_history_message(message)
+    if _is_legacy_raw_subagent_result(message):
         return None
     content = message.get("content")
     text = content if isinstance(content, str) else ""
@@ -549,9 +1111,20 @@ def _merge_tool_events(previous: Any, incoming: list[dict[str, Any]]) -> list[di
 def _file_edit_key(edit: dict[str, Any]) -> str:
     call_id = str(edit.get("call_id") or "")
     tool = str(edit.get("tool") or "")
+    path = str(edit.get("path") or "")
+    if call_id and path:
+        return f"{call_id}|{tool}|{path}"
     if call_id:
         return f"{call_id}|{tool}"
-    return f"{tool}|{edit.get('path') or ''}"
+    return f"{tool}|{path}"
+
+
+def _file_edit_tool_event_key(edit: dict[str, Any]) -> str:
+    call_id = str(edit.get("call_id") or "")
+    tool = str(edit.get("tool") or "")
+    if call_id:
+        return f"{call_id}|{tool}"
+    return _file_edit_key(edit)
 
 
 def _message_has_file_edit_for_tool_event(
@@ -564,7 +1137,10 @@ def _message_has_file_edit_for_tool_event(
     edits = message.get("fileEdits")
     if not isinstance(edits, list):
         return False
-    return any(isinstance(edit, dict) and _file_edit_key(edit) == key for edit in edits)
+    return any(
+        isinstance(edit, dict) and _file_edit_tool_event_key(edit) == key
+        for edit in edits
+    )
 
 
 def _filter_covered_file_edit_tool_events(
@@ -585,7 +1161,7 @@ def _strip_covered_file_edit_tool_hints(
     edits: list[dict[str, Any]],
 ) -> dict[str, Any]:
     incoming_keys = {
-        _file_edit_key(edit)
+        _file_edit_tool_event_key(edit)
         for edit in edits
         if isinstance(edit, dict)
     }
@@ -719,9 +1295,12 @@ def replay_transcript_to_ui_messages(
 
     def _source_fields(rec: dict[str, Any]) -> dict[str, Any]:
         source = rec.get("source")
-        if not isinstance(source, dict) or source.get("kind") != "cron":
+        if not isinstance(source, dict):
             return {}
-        out: dict[str, Any] = {"source": {"kind": "cron"}}
+        kind = source.get("kind")
+        if not is_automation_kind(kind):
+            return {}
+        out: dict[str, Any] = {"source": {"kind": kind}}
         label = source.get("label")
         if isinstance(label, str) and label.strip():
             out["source"]["label"] = label.strip()
@@ -922,6 +1501,11 @@ def replay_transcript_to_ui_messages(
         edits: list[dict[str, Any]],
     ) -> int | None:
         incoming_keys = {_file_edit_key(edit) for edit in edits if isinstance(edit, dict)}
+        incoming_tool_event_keys = {
+            _file_edit_tool_event_key(edit)
+            for edit in edits
+            if isinstance(edit, dict)
+        }
         for i in range(len(messages) - 1, -1, -1):
             candidate = messages[i]
             if candidate.get("role") == "user":
@@ -933,17 +1517,60 @@ def replay_transcript_to_ui_messages(
             existing_edits = candidate.get("fileEdits")
             if isinstance(existing_edits, list):
                 for existing in existing_edits:
-                    if isinstance(existing, dict) and _file_edit_key(existing) in incoming_keys:
-                        return i
-            existing_tool_events = candidate.get("toolEvents")
-            if isinstance(existing_tool_events, list):
-                for event in existing_tool_events:
-                    if not isinstance(event, dict):
+                    if not isinstance(existing, dict):
                         continue
-                    key = _tool_event_file_edit_key(event)
-                    if key and key in incoming_keys:
+                    if (
+                        _file_edit_key(existing) in incoming_keys
+                        or (
+                            not existing.get("path")
+                            and existing.get("pending")
+                            and _file_edit_tool_event_key(existing) in incoming_tool_event_keys
+                        )
+                    ):
                         return i
         return None
+
+    def trace_message_is_empty(message: dict[str, Any]) -> bool:
+        traces = message.get("traces")
+        if isinstance(traces, list):
+            has_trace = any(isinstance(trace, str) and trace.strip() for trace in traces)
+        else:
+            has_trace = bool(str(message.get("content") or "").strip())
+        return (
+            message.get("kind") == "trace"
+            and not has_trace
+            and not message.get("toolEvents")
+            and not message.get("fileEdits")
+            and not message.get("media")
+        )
+
+    def strip_covered_file_edit_tool_hints_from_recent_messages(
+        edits: list[dict[str, Any]],
+        turn_fields: dict[str, Any],
+    ) -> None:
+        nonlocal messages
+        if not edits:
+            return
+        next_messages = list(messages)
+        changed = False
+        for i in range(len(next_messages) - 1, -1, -1):
+            candidate = next_messages[i]
+            if candidate.get("role") == "user":
+                break
+            if candidate.get("kind") != "trace":
+                continue
+            if not _same_turn(candidate, turn_fields):
+                continue
+            cleaned = _strip_covered_file_edit_tool_hints(candidate, edits)
+            if cleaned is candidate:
+                continue
+            changed = True
+            if trace_message_is_empty(cleaned):
+                next_messages.pop(i)
+            else:
+                next_messages[i] = cleaned
+        if changed:
+            messages = next_messages
 
     def upsert_file_edits(
         edits: list[dict[str, Any]],
@@ -959,12 +1586,12 @@ def replay_transcript_to_ui_messages(
             segment = _new_activity_segment(activate=False)
             active_file_edit_segment_id = segment
         demote_interrupted_assistant(segment)
+        strip_covered_file_edit_tool_hints_from_recent_messages(edits, turn_fields)
         target_index = find_file_edit_trace_index(segment, edits)
         if target_index is not None:
             last = messages[target_index]
             segment = str(last.get("activitySegmentId") or segment or _new_activity_segment(activate=False))
             active_file_edit_segment_id = segment
-            last = _strip_covered_file_edit_tool_hints(last, edits)
         else:
             if not segment:
                 segment = _new_activity_segment(activate=False)
@@ -997,12 +1624,24 @@ def replay_transcript_to_ui_messages(
             if not isinstance(edit, dict):
                 continue
             key = _file_edit_key(edit)
-            if key in index_by_key:
-                pos = index_by_key[key]
+            pos = index_by_key.get(key)
+            if pos is None and edit.get("path"):
+                event_key = _file_edit_tool_event_key(edit)
+                for existing_pos, existing_edit in enumerate(existing):
+                    if (
+                        isinstance(existing_edit, dict)
+                        and not existing_edit.get("path")
+                        and existing_edit.get("pending")
+                        and _file_edit_tool_event_key(existing_edit) == event_key
+                    ):
+                        pos = existing_pos
+                        break
+            if pos is not None:
                 merged = {**existing[pos], **edit}
                 if edit.get("path") and not edit.get("pending"):
                     merged.pop("pending", None)
                 existing[pos] = merged
+                index_by_key[key] = pos
             else:
                 index_by_key[key] = len(existing)
                 existing.append(dict(edit))
@@ -1278,6 +1917,38 @@ def replay_transcript_to_ui_messages(
     return messages
 
 
+def fork_boundary_message_count(lines: list[dict[str, Any]]) -> int | None:
+    """Return the replayed UI message count before the first fork marker, if any."""
+    for idx, rec in enumerate(lines):
+        if rec.get("event") != WEBUI_FORK_MARKER_EVENT:
+            continue
+        return len(replay_transcript_to_ui_messages(lines[:idx]))
+    return None
+
+
+def has_pending_tool_calls(lines: list[dict[str, Any]]) -> bool:
+    """Return True when the selected transcript tail looks like an unfinished turn."""
+    for rec in reversed(lines):
+        ev = rec.get("event")
+        if ev == "turn_end":
+            return False
+        if ev == "user":
+            return False
+        if ev == "message":
+            return rec.get("kind") in {"tool_hint", "progress", "reasoning"}
+        if ev in {
+            "delta",
+            "stream_end",
+            "reasoning_delta",
+            "reasoning_end",
+            "file_edit",
+        }:
+            return True
+        if ev in {WEBUI_FORK_MARKER_EVENT}:
+            continue
+    return False
+
+
 def build_webui_thread_response(
     session_key: str,
     *,
@@ -1285,20 +1956,36 @@ def build_webui_thread_response(
     augment_assistant_media: Callable[[list[str]], list[dict[str, Any]]] | None = None,
     augment_assistant_text: Callable[[str], str] | None = None,
     session_messages: list[dict[str, Any]] | None = None,
+    limit: int | None = None,
+    direction: str | None = None,
+    before: str | None = None,
 ) -> dict[str, Any] | None:
     """Return a payload compatible with ``WebuiThreadPersistedPayload``."""
-    lines = read_transcript_lines(session_key)
+    paginated = limit is not None or direction is not None or before is not None
+    page: dict[str, Any] | None = None
+    if paginated:
+        lines, page = _select_transcript_page(session_key, limit=limit, before=before)
+    else:
+        lines = read_transcript_lines(session_key)
     if not lines:
         return None
     lines = inject_missing_user_events_from_session(session_key, lines, session_messages)
+    fork_boundary = fork_boundary_message_count(lines)
     msgs = replay_transcript_to_ui_messages(
         lines,
         augment_user_media=augment_user_media,
         augment_assistant_media=augment_assistant_media,
         augment_assistant_text=augment_assistant_text,
     )
-    return {
+    payload = {
         "schemaVersion": WEBUI_TRANSCRIPT_SCHEMA_VERSION,
         "sessionKey": session_key,
         "messages": msgs,
+        "has_pending_tool_calls": has_pending_tool_calls(lines),
     }
+    if page is not None:
+        page["loaded_message_count"] = len(msgs)
+        payload["page"] = page
+    if fork_boundary is not None:
+        payload["fork_boundary_message_count"] = fork_boundary
+    return payload

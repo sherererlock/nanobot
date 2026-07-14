@@ -1,11 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  configureChannel,
   createModelConfiguration,
   deleteSession,
   fetchFilePreview,
+  fetchAutomations,
+  fetchApiService,
   fetchCliApps,
+  fetchInstalledCliApps,
   fetchMcpPresets,
+  fetchNanobotFeatures,
   fetchProviderModels,
   fetchSessionAutomations,
   fetchSettingsUsage,
@@ -19,9 +24,18 @@ import {
   listSlashCommands,
   loginProviderOAuth,
   logoutProviderOAuth,
+  disableNanobotFeature,
+  enableNanobotFeature,
+  runAutomationAction,
   runCliAppAction,
   runMcpPresetAction,
   saveCustomMcpServer,
+  startApiService,
+  stopApiService,
+  cancelChannelConnect,
+  pollChannelConnect,
+  startChannelConnect,
+  updateAutomation,
   updateSidebarState,
   updateImageGenerationSettings,
   updateModelConfiguration,
@@ -30,6 +44,7 @@ import {
   updateProviderSettings,
   updateSettings,
   updateWebSearchSettings,
+  validateChannel,
 } from "@/lib/api";
 
 describe("webui API helpers", () => {
@@ -60,6 +75,21 @@ describe("webui API helpers", () => {
     );
   });
 
+  it("passes pagination params when fetching a WebUI thread page", async () => {
+    await fetchWebuiThread("tok", "websocket:chat-1", {
+      limit: 120,
+      before: "abc+/=",
+    });
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/sessions/websocket%3Achat-1/webui-thread?limit=120&before=abc%2B%2F%3D",
+      expect.objectContaining({
+        headers: { Authorization: "Bearer tok" },
+        credentials: "same-origin",
+      }),
+    );
+  });
+
   it("percent-encodes websocket keys and paths when fetching file previews", async () => {
     await fetchFilePreview("tok", "websocket:chat-1", "/tmp/project/hook.py:12");
 
@@ -81,6 +111,125 @@ describe("webui API helpers", () => {
         headers: { Authorization: "Bearer tok" },
       }),
     );
+  });
+
+  it("fetches workspace automations", async () => {
+    await fetchAutomations("tok");
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/webui/automations",
+      expect.objectContaining({
+        headers: { Authorization: "Bearer tok" },
+      }),
+    );
+  });
+
+  it("validates channel settings with form values", async () => {
+    await validateChannel(
+      "tok",
+      "slack",
+      { "channels.slack.botToken": "xoxb-test" },
+      { instanceId: "default" },
+    );
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/settings/channels/validate?name=slack&instance_id=default",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: "Bearer tok",
+          "X-Nanobot-Channel-Values": JSON.stringify({
+            "channels.slack.botToken": "xoxb-test",
+          }),
+        }),
+      }),
+    );
+    expect(fetch).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("configures channels through the WebSocket HTTP shim", async () => {
+    await configureChannel(
+      "tok",
+      "discord",
+      { "channels.discord.token": "saved-secret" },
+      { enable: true },
+    );
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/settings/channels/configure?name=discord&enable=true",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: "Bearer tok",
+          "X-Nanobot-Channel-Values": JSON.stringify({
+            "channels.discord.token": "saved-secret",
+          }),
+        }),
+      }),
+    );
+    expect(fetch).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("serializes channel QR connect helpers", async () => {
+    await startChannelConnect("tok", "weixin", { force: true });
+    expect(fetch).toHaveBeenLastCalledWith(
+      "/api/settings/channels/weixin/connect/start?force=true",
+      expect.objectContaining({
+        headers: { Authorization: "Bearer tok" },
+      }),
+    );
+
+    await pollChannelConnect("tok", "weixin", "session+/=");
+    expect(fetch).toHaveBeenLastCalledWith(
+      "/api/settings/channels/weixin/connect/poll?session_id=session%2B%2F%3D",
+      expect.objectContaining({
+        headers: { Authorization: "Bearer tok" },
+      }),
+    );
+
+    await cancelChannelConnect("tok", "weixin", "session+/=");
+    expect(fetch).toHaveBeenLastCalledWith(
+      "/api/settings/channels/weixin/connect/cancel?session_id=session%2B%2F%3D",
+      expect.objectContaining({
+        headers: { Authorization: "Bearer tok" },
+      }),
+    );
+  });
+
+  it("serializes workspace automation actions", async () => {
+    await runAutomationAction("tok", "disable", "job 1/2");
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/webui/automations/disable?id=job+1%2F2",
+      expect.objectContaining({
+        headers: { Authorization: "Bearer tok" },
+      }),
+    );
+  });
+
+  it("serializes workspace automation updates", async () => {
+    const values = {
+      name: "每日测验",
+      message: "Ask 今日 quiz",
+      schedule: { kind: "cron", expr: "0 9 * * *", tz: "Asia/Shanghai" },
+    } as const;
+    await updateAutomation("tok", "job 1/2", values);
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/webui/automations/update?id=job+1%2F2",
+      expect.objectContaining({
+        headers: {
+          Authorization: "Bearer tok",
+          "X-Nanobot-Automation-Values": encodeURIComponent(JSON.stringify(values)),
+        },
+      }),
+    );
+    const header = vi.mocked(fetch).mock.calls[0][1]?.headers as Record<string, string>;
+    expect(header["X-Nanobot-Automation-Values"]).not.toContain("每日");
   });
 
   it("fetches the WebUI skill summary", async () => {
@@ -110,6 +259,17 @@ describe("webui API helpers", () => {
 
     expect(fetch).toHaveBeenCalledWith(
       "/api/sessions/websocket%3Achat-1/delete",
+      expect.objectContaining({
+        headers: { Authorization: "Bearer tok" },
+      }),
+    );
+  });
+
+  it("passes the automation cascade flag when deleting a session", async () => {
+    await deleteSession("tok", "websocket:chat-1", { deleteAutomations: true });
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/sessions/websocket%3Achat-1/delete?delete_automations=true",
       expect.objectContaining({
         headers: { Authorization: "Bearer tok" },
       }),
@@ -349,6 +509,97 @@ describe("webui API helpers", () => {
     );
   });
 
+  it("reads installed CLI Apps without fetching the full catalog", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        apps: [],
+        installed_count: 0,
+        catalog_updated_at: null,
+      }),
+    } as Response);
+
+    await expect(fetchInstalledCliApps("tok")).resolves.toMatchObject({ apps: [] });
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/settings/cli-apps?installed_only=1",
+      expect.objectContaining({
+        headers: { Authorization: "Bearer tok" },
+      }),
+    );
+  });
+
+  it("reads and toggles nanobot optional features", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        features: [],
+        enabled_count: 0,
+      }),
+    } as Response);
+
+    await expect(fetchNanobotFeatures("tok")).resolves.toMatchObject({ features: [] });
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/settings/nanobot-features",
+      expect.objectContaining({
+        headers: { Authorization: "Bearer tok" },
+      }),
+    );
+
+    await enableNanobotFeature("tok", "matrix");
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/settings/nanobot-features/enable?name=matrix",
+      expect.objectContaining({
+        headers: { Authorization: "Bearer tok" },
+      }),
+    );
+
+    await disableNanobotFeature("tok", "matrix");
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/settings/nanobot-features/disable?name=matrix",
+      expect.objectContaining({
+        headers: { Authorization: "Bearer tok" },
+      }),
+    );
+  });
+
+  it("manages the API service capability", async () => {
+    await fetchApiService("tok");
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/settings/api-service",
+      expect.objectContaining({ headers: { Authorization: "Bearer tok" } }),
+    );
+
+    await startApiService("tok", { host: "127.0.0.1", port: 8900, timeout: 120 });
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/settings/api-service/start?host=127.0.0.1&port=8900&timeout=120",
+      expect.objectContaining({ headers: { Authorization: "Bearer tok" } }),
+    );
+
+    await startApiService(
+      "tok",
+      { host: "0.0.0.0", port: 8900, timeout: 120, apiKey: "secret-token" },
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/settings/api-service/start?host=0.0.0.0&port=8900&timeout=120",
+      expect.objectContaining({
+        headers: {
+          Authorization: "Bearer tok",
+          "X-Nanobot-API-Service-Values": JSON.stringify({ api_key: "secret-token" }),
+        },
+      }),
+    );
+    expect(fetch).not.toHaveBeenCalledWith(
+      expect.stringContaining("secret-token"),
+      expect.anything(),
+    );
+
+    await stopApiService("tok");
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/settings/api-service/stop",
+      expect.objectContaining({ headers: { Authorization: "Bearer tok" } }),
+    );
+  });
+
   it("reads MCP presets and serializes actions", async () => {
     vi.mocked(fetch).mockResolvedValueOnce({
       ok: true,
@@ -545,12 +796,16 @@ describe("webui API helpers", () => {
             title: "Stop current task",
             description: "Cancel the active task.",
             icon: "square",
+            lifecycle: "stop_active_turn",
+            accepts_args: false,
           },
           {
             command: "/restart",
             title: "Restart nanobot",
             description: "Restart the bot process.",
             icon: "rotate-cw",
+            lifecycle: "side_channel",
+            accepts_args: false,
           },
           {
             command: "/history",
@@ -558,6 +813,14 @@ describe("webui API helpers", () => {
             description: "Print the last N messages.",
             icon: "history",
             arg_hint: "[n]",
+            lifecycle: "side_channel",
+            accepts_args: true,
+          },
+          {
+            command: "/legacy",
+            title: "Legacy row",
+            description: "Old metadata should not be guessed.",
+            icon: "circle-help",
           },
         ],
       }),
@@ -565,11 +828,31 @@ describe("webui API helpers", () => {
 
     await expect(listSlashCommands("tok")).resolves.toEqual([
       {
+        command: "/stop",
+        title: "Stop current task",
+        description: "Cancel the active task.",
+        icon: "square",
+        argHint: "",
+        lifecycle: "stop_active_turn",
+        acceptsArgs: false,
+      },
+      {
+        command: "/restart",
+        title: "Restart nanobot",
+        description: "Restart the bot process.",
+        icon: "rotate-cw",
+        argHint: "",
+        lifecycle: "side_channel",
+        acceptsArgs: false,
+      },
+      {
         command: "/history",
         title: "Show conversation history",
         description: "Print the last N messages.",
         icon: "history",
         argHint: "[n]",
+        lifecycle: "side_channel",
+        acceptsArgs: true,
       },
     ]);
     expect(fetch).toHaveBeenCalledWith(

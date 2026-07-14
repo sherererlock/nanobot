@@ -1,5 +1,7 @@
 """Feishu/Lark channel implementation using lark-oapi SDK with WebSocket long connection."""
 
+from __future__ import annotations
+
 import asyncio
 import importlib.util
 import json
@@ -11,21 +13,126 @@ import uuid
 from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Literal
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Literal
 
-from lark_oapi.api.im.v1.model import MentionEvent, P2ImMessageReceiveV1
-from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
 from pydantic import Field
+from rich.console import Console
+from rich.markup import escape
+from rich.panel import Panel
+from rich.text import Text
 
 from nanobot.bus.events import OutboundMessage
+from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
+from nanobot.channels._feishu_instances import (
+    DEFAULT_INSTANCE_ID,
+    feishu_instance_specs,
+    runtime_channel_name,
+    update_feishu_instance_preserving_shape,
+    upsert_feishu_instance,
+)
+from nanobot.channels._feishu_ws import get_feishu_ws_runner
 from nanobot.channels.base import BaseChannel
+from nanobot.command.router import normalize_command_text
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
+from nanobot.pairing import clear_channel
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.logging_bridge import redirect_lib_logging
 
+if TYPE_CHECKING:
+    from lark_oapi.api.im.v1.model import MentionEvent, P2ImMessageReceiveV1
+
 FEISHU_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
+_LOGIN_CONSOLE = Console()
+
+
+def _identity_timestamp() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _load_lark_runtime() -> tuple[Any, str, str]:
+    """Import the heavy Feishu SDK lazily.
+
+    lark_oapi imports a large generated API surface at module import time, so
+    keep it out of channel discovery and constructor paths.
+    """
+    import sys
+
+    ws_client_already_imported = "lark_oapi.ws.client" in sys.modules
+    import lark_oapi as lark
+    import lark_oapi.ws.client as lark_ws_client
+    from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
+
+    if (
+        not ws_client_already_imported
+        and threading.current_thread() is not threading.main_thread()
+    ):
+        import_loop = getattr(lark_ws_client, "loop", None)
+        if (
+            import_loop is not None
+            and not import_loop.is_running()
+            and not import_loop.is_closed()
+        ):
+            import_loop.close()
+        lark_ws_client.loop = None
+        with suppress(Exception):
+            asyncio.set_event_loop(None)
+
+    return lark, FEISHU_DOMAIN, LARK_DOMAIN
+
+
+def fetch_feishu_app_identity(
+    app_id: str,
+    app_secret: str,
+    domain: str = "feishu",
+) -> dict[str, str]:
+    """Fetch the user-facing Feishu/Lark app identity for display.
+
+    This is best-effort metadata for WebUI presentation.  Callers should treat
+    an empty result as a normal fallback path.
+    """
+    if not FEISHU_AVAILABLE or not app_id or not app_secret:
+        return {}
+
+    try:
+        lark, feishu_domain, lark_domain = _load_lark_runtime()
+        from lark_oapi.api.application.v6.model.get_application_request import (
+            GetApplicationRequest,
+        )
+
+        sdk_domain = lark_domain if domain == "lark" else feishu_domain
+        client = (
+            lark.Client.builder()
+            .app_id(app_id)
+            .app_secret(app_secret)
+            .domain(sdk_domain)
+            .timeout(5)
+            .build()
+        )
+        request = GetApplicationRequest.builder().app_id(app_id).lang("zh_cn").build()
+        response = client.application.v6.application.get(request)
+        if hasattr(response, "success") and not response.success():
+            return {}
+
+        app = getattr(getattr(response, "data", None), "app", None)
+        if app is None:
+            return {}
+
+        identity: dict[str, str] = {}
+        display_name = str(getattr(app, "app_name", "") or "").strip()
+        avatar_url = str(getattr(app, "avatar_url", "") or "").strip()
+        if display_name:
+            identity["displayName"] = display_name
+        if avatar_url:
+            identity["avatarUrl"] = avatar_url
+        if identity:
+            identity["identityFetchedAt"] = _identity_timestamp()
+        return identity
+    except Exception:
+        return {}
+
 
 # Message type display mapping
 MSG_TYPE_MAP = {
@@ -69,6 +176,18 @@ def _extract_interactive_content(content: dict) -> list[str]:
     if not isinstance(content, dict):
         return parts
 
+    # user_dsl: original card definition (richest source for rendered cards)
+    user_dsl = content.get("user_dsl")
+    if isinstance(user_dsl, str) and user_dsl.strip():
+        try:
+            dsl = json.loads(user_dsl)
+            if isinstance(dsl, dict):
+                parts.extend(_extract_interactive_content(dsl))
+                if parts:
+                    return parts
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     if "title" in content:
         title = content["title"]
         if isinstance(title, dict):
@@ -78,11 +197,27 @@ def _extract_interactive_content(content: dict) -> list[str]:
         elif isinstance(title, str):
             parts.append(f"title: {title}")
 
-    for elements in (
-        content.get("elements", []) if isinstance(content.get("elements"), list) else []
-    ):
-        for element in elements:
-            parts.extend(_extract_element_content(element))
+    # Top-level elements: flat list or nested list format
+    elements = content.get("elements")
+    if isinstance(elements, list):
+        if elements and isinstance(elements[0], list):
+            # Nested list: [[{tag:"text",text:"..."}], ...]
+            for row in elements:
+                if isinstance(row, list):
+                    for element in row:
+                        parts.extend(_extract_element_content(element))
+        else:
+            # Flat list: [{tag:"markdown",content:"..."}, ...]
+            for element in elements:
+                parts.extend(_extract_element_content(element))
+
+    # Body elements (schema 2.0)
+    body = content.get("body", {})
+    if isinstance(body, dict):
+        body_elements = body.get("elements")
+        if isinstance(body_elements, list):
+            for element in body_elements:
+                parts.extend(_extract_element_content(element))
 
     card = content.get("card", {})
     if card:
@@ -112,6 +247,11 @@ def _extract_element_content(element: dict) -> list[str]:
         content = element.get("content", "")
         if content:
             parts.append(content)
+
+    elif tag == "text":
+        text = element.get("text", "")
+        if isinstance(text, str) and text.strip():
+            parts.append(text)
 
     elif tag == "div":
         text = element.get("text", {})
@@ -164,6 +304,29 @@ def _extract_element_content(element: dict) -> list[str]:
         content = element.get("content", "")
         if content:
             parts.append(content)
+
+    elif tag == "table":
+        columns = [
+            (column["name"], str(column.get("display_name") or column["name"]))
+            for column in (element.get("columns") or [])
+            if isinstance(column, dict) and column.get("name")
+        ]
+        rows = element.get("rows", [])
+        if columns:
+            parts.append(" | ".join(header for _, header in columns))
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                values = []
+                for name, _ in columns:
+                    value = row.get(name)
+                    if isinstance(value, list):
+                        value = " ".join(str(item).strip() for item in value if item is not None)
+                    values.append("" if value is None else str(value).strip())
+                row_text = " | ".join(values).strip()
+                if row_text:
+                    parts.append(row_text)
 
     else:
         for ne in element.get("elements", []):
@@ -246,6 +409,9 @@ def _extract_post_text(content_json: dict) -> str:
 class FeishuConfig(Base):
     """Feishu/Lark channel configuration using WebSocket long connection."""
 
+    instance_id: str = DEFAULT_INSTANCE_ID
+    name: str = "nanobot"
+    identity_key: str = ""
     enabled: bool = False
     app_id: str = ""
     app_secret: str = ""
@@ -262,7 +428,416 @@ class FeishuConfig(Base):
     topic_isolation: bool = True  # If True, each topic in group chat gets its own session (isolation)
 
 
+# =============================================================================
+# QR scan-to-create onboarding
+#
+# Device-code flow: user scans a QR code with the Feishu/Lark mobile app and
+# the platform creates a fully configured bot application automatically.
+# =============================================================================
+
+_ONBOARD_ACCOUNTS_URLS = {
+    "feishu": "https://accounts.feishu.cn",
+    "lark": "https://accounts.larksuite.com",
+}
+_REGISTRATION_PATH = "/oauth/v1/app/registration"
+_ONBOARD_REQUEST_TIMEOUT_S = 10
+
+
+def _accounts_base_url(domain: str) -> str:
+    return _ONBOARD_ACCOUNTS_URLS.get(domain, _ONBOARD_ACCOUNTS_URLS["feishu"])
+
+
+def _post_registration(base_url: str, body: dict[str, str]) -> dict:
+    """POST form-encoded data to the registration endpoint, return parsed JSON.
+
+    The registration endpoint returns JSON even on HTTP errors (e.g. poll
+    returns authorization_pending as a 400). We always parse the body.
+    """
+    import httpx
+
+    url = f"{base_url}{_REGISTRATION_PATH}"
+    resp = httpx.post(
+        url,
+        data=body,
+        timeout=_ONBOARD_REQUEST_TIMEOUT_S,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        return resp.json()
+    except json.JSONDecodeError:
+        resp.raise_for_status()
+        return {}
+
+
+def _init_registration(domain: str = "feishu") -> None:
+    """Verify the environment supports client_secret auth. Raises RuntimeError if not."""
+    base_url = _accounts_base_url(domain)
+    res = _post_registration(base_url, {"action": "init"})
+    methods = res.get("supported_auth_methods") or []
+    if "client_secret" not in methods:
+        raise RuntimeError(
+            f"Feishu / Lark registration does not support client_secret auth. "
+            f"Supported: {methods}"
+        )
+
+
+def _begin_registration(domain: str = "feishu") -> dict:
+    """Start the device-code flow. Returns device_code, qr_url, interval, expire_in."""
+    base_url = _accounts_base_url(domain)
+    res = _post_registration(base_url, {
+        "action": "begin",
+        "archetype": "PersonalAgent",
+        "auth_method": "client_secret",
+        "request_user_info": "open_id",
+    })
+    device_code = res.get("device_code")
+    if not device_code:
+        raise RuntimeError("Feishu / Lark registration did not return a device_code")
+    qr_url = res.get("verification_uri_complete", "")
+    if not qr_url:
+        raise RuntimeError("Feishu / Lark registration did not return a login URL")
+    return {
+        "device_code": device_code,
+        "qr_url": qr_url,
+        "interval": res.get("interval") or 5,
+        "expire_in": res.get("expire_in") or 600,
+    }
+
+
+def _poll_registration(
+    *,
+    device_code: str,
+    interval: int,
+    expire_in: int,
+    domain: str = "feishu",
+) -> dict | None:
+    """Poll until the user scans the QR code, or timeout/denial.
+
+    Returns dict with app_id, app_secret, domain on success, None on failure.
+    """
+    deadline = time.monotonic() + expire_in
+    current_domain = domain
+
+    while time.monotonic() < deadline:
+        try:
+            res = poll_registration_once(device_code=device_code, domain=current_domain)
+        except Exception:
+            time.sleep(interval)
+            continue
+
+        current_domain = res.get("domain", current_domain)
+
+        if res.get("status") == "succeeded":
+            return {
+                "app_id": res["app_id"],
+                "app_secret": res["app_secret"],
+                "domain": res.get("domain", current_domain),
+            }
+
+        if res.get("status") == "failed":
+            _LOGIN_CONSOLE.print("[yellow]Authorization was cancelled or expired.[/yellow]")
+            return None
+
+        # authorization_pending or unknown — keep polling
+        time.sleep(interval)
+
+    _LOGIN_CONSOLE.print("[yellow]Authorization timed out.[/yellow]")
+    return None
+
+
+def poll_registration_once(
+    *,
+    device_code: str,
+    domain: str = "feishu",
+) -> dict:
+    """Poll the Feishu/Lark device-code flow once.
+
+    This non-blocking shape is used by WebUI. The CLI keeps using
+    ``_poll_registration`` to wait in the terminal.
+    """
+    current_domain = domain
+    base_url = _accounts_base_url(current_domain)
+    res = _post_registration(base_url, {
+        "action": "poll",
+        "device_code": device_code,
+        "tp": "ob_app",
+    })
+
+    user_info = res.get("user_info") or {}
+    tenant_brand = user_info.get("tenant_brand")
+    if tenant_brand == "lark":
+        current_domain = "lark"
+
+    if res.get("client_id") and res.get("client_secret"):
+        return {
+            "status": "succeeded",
+            "app_id": res["client_id"],
+            "app_secret": res["client_secret"],
+            "domain": current_domain,
+        }
+
+    error = res.get("error", "")
+    if error in ("access_denied", "expired_token"):
+        return {
+            "status": "failed",
+            "error": error,
+            "domain": current_domain,
+        }
+
+    return {
+        "status": "pending",
+        "domain": current_domain,
+    }
+
+
+def _feishu_app_identity_key(app_id: str, domain: str) -> str:
+    normalized_app_id = app_id.strip()
+    normalized_domain = "lark" if domain.strip().lower() == "lark" else "feishu"
+    return f"{normalized_domain}:{normalized_app_id}" if normalized_app_id else ""
+
+
+def _saved_feishu_instance_identity_key(
+    feishu_cfg: Any,
+    defaults: dict[str, Any],
+    instance_id: str,
+) -> str:
+    for spec in feishu_instance_specs(feishu_cfg, defaults):
+        if spec.instance_id == instance_id:
+            return _feishu_app_identity_key(
+                str(spec.config.get("appId") or spec.config.get("app_id") or ""),
+                str(spec.config.get("domain") or "feishu"),
+            )
+    return ""
+
+
+def sync_saved_feishu_identity_boundary(
+    *,
+    instance_id: str,
+    app_id: str,
+    domain: str,
+) -> bool:
+    """Persist the Feishu app identity marker and clear access if it changed.
+
+    WebUI connect normally handles this at save time. This startup check catches
+    manual config edits so approved users do not accidentally carry over to a
+    different Feishu/Lark app in the same local instance slot.
+    """
+    current_identity_key = _feishu_app_identity_key(app_id, domain)
+    if not current_identity_key:
+        return False
+
+    from nanobot.config.loader import load_config, save_config
+
+    full_config = load_config()
+    feishu_cfg = getattr(full_config.channels, "feishu", None) or {}
+    if not isinstance(feishu_cfg, dict):
+        feishu_cfg = {}
+
+    defaults = FeishuChannel.default_config()
+    previous_identity_key = ""
+    for spec in feishu_instance_specs(feishu_cfg, defaults):
+        if spec.instance_id == instance_id:
+            previous_identity_key = str(
+                spec.config.get("identityKey") or spec.config.get("identity_key") or ""
+            )
+            break
+
+    access_cleared = bool(previous_identity_key and previous_identity_key != current_identity_key)
+    values: dict[str, Any] = {"identityKey": current_identity_key}
+    if access_cleared:
+        values["allowFrom"] = []
+        values["allow_from"] = []
+        clear_channel(runtime_channel_name("feishu", instance_id))
+
+    if not previous_identity_key or access_cleared:
+        feishu_cfg = update_feishu_instance_preserving_shape(
+            feishu_cfg,
+            defaults,
+            instance_id,
+            values,
+        )
+        setattr(full_config.channels, "feishu", feishu_cfg)
+        save_config(full_config)
+
+    return access_cleared
+
+
+def save_registration_result(
+    result: dict,
+    *,
+    instance_id: str = DEFAULT_INSTANCE_ID,
+    name: str | None = None,
+) -> None:
+    """Persist a successful Feishu/Lark registration result to config.json."""
+    from nanobot.config.loader import load_config, save_config
+
+    full_config = load_config()
+    feishu_cfg = getattr(full_config.channels, "feishu", None) or {}
+    if not isinstance(feishu_cfg, dict):
+        feishu_cfg = {}
+    defaults = FeishuChannel.default_config()
+    app_id = str(result["app_id"]).strip()
+    domain = str(result.get("domain", "feishu") or "feishu").strip().lower()
+    domain = "lark" if domain == "lark" else "feishu"
+    previous_identity_key = _saved_feishu_instance_identity_key(feishu_cfg, defaults, instance_id)
+    next_identity_key = _feishu_app_identity_key(app_id, domain)
+    identity_changed = bool(previous_identity_key and previous_identity_key != next_identity_key)
+    identity: dict[str, str] = {}
+    with suppress(Exception):
+        identity = fetch_feishu_app_identity(
+            app_id,
+            str(result["app_secret"]),
+            domain,
+        )
+    values = {
+        "name": name or ("nanobot" if instance_id == DEFAULT_INSTANCE_ID else f"nanobot {instance_id}"),
+        "appId": app_id,
+        "appSecret": result["app_secret"],
+        "domain": domain,
+        "identityKey": next_identity_key,
+        "enabled": True,
+        **identity,
+    }
+    if identity_changed:
+        values["allowFrom"] = []
+        values["allow_from"] = []
+        clear_channel(runtime_channel_name("feishu", instance_id))
+    feishu_cfg = upsert_feishu_instance(
+        feishu_cfg,
+        defaults,
+        instance_id,
+        values,
+    )
+    setattr(full_config.channels, "feishu", feishu_cfg)
+    save_config(full_config)
+
+
+def refresh_saved_feishu_identities(config: Any | None = None) -> bool:
+    """Backfill missing Feishu assistant display identity in saved config.
+
+    Existing users may already have working App ID/Secret credentials from
+    older builds. Fetch identity only when an instance has credentials but no
+    identity metadata at all, then persist the attempt so Settings does not hit
+    Feishu on every render.
+    """
+    if not FEISHU_AVAILABLE:
+        return False
+
+    from nanobot.config.loader import load_config, save_config
+
+    full_config = config or load_config()
+    feishu_cfg = getattr(full_config.channels, "feishu", None)
+    defaults = FeishuChannel.default_config()
+    specs = feishu_instance_specs(feishu_cfg, defaults)
+    updated = False
+
+    for spec in specs:
+        instance = spec.config
+        if (
+            instance.get("displayName")
+            or instance.get("avatarUrl")
+            or instance.get("identityFetchedAt")
+        ):
+            continue
+
+        app_id = str(instance.get("appId") or instance.get("app_id") or "").strip()
+        app_secret = str(instance.get("appSecret") or instance.get("app_secret") or "").strip()
+        if not app_id or not app_secret:
+            continue
+
+        identity = fetch_feishu_app_identity(
+            app_id,
+            app_secret,
+            str(instance.get("domain") or "feishu"),
+        )
+        if not identity:
+            identity = {"identityFetchedAt": _identity_timestamp()}
+
+        feishu_cfg = update_feishu_instance_preserving_shape(
+            feishu_cfg,
+            defaults,
+            spec.instance_id,
+            identity,
+        )
+        updated = True
+
+    if not updated:
+        return False
+
+    setattr(full_config.channels, "feishu", feishu_cfg)
+    save_config(full_config)
+    return True
+
+
+def qr_register(
+    *,
+    initial_domain: str = "feishu",
+) -> dict | None:
+    """Run the Feishu / Lark scan-to-create QR registration flow.
+
+    Returns on success:
+        {
+            "app_id": str,
+            "app_secret": str,
+            "domain": "feishu" | "lark",
+        }
+
+    Returns None on expected failures (network, auth denied, timeout).
+    Unexpected errors (bugs, protocol regressions) propagate to the caller.
+    """
+    import httpx
+
+    try:
+        return _qr_register_inner(initial_domain=initial_domain)
+    except (RuntimeError, OSError, json.JSONDecodeError, httpx.HTTPError) as exc:
+        _LOGIN_CONSOLE.print(
+            f"[yellow]Unable to start Feishu/Lark login:[/yellow] {escape(str(exc))}"
+        )
+        return None
+
+
+def _print_qr_code(url: str) -> None:
+    """Print QR code as ASCII art if qrcode package is available, otherwise print URL."""
+    try:
+        import qrcode as qr_lib
+
+        _LOGIN_CONSOLE.print("\n[bold]Scan with Feishu or Lark[/bold]\n")
+        qr = qr_lib.QRCode(border=1)
+        qr.add_data(url)
+        qr.make(fit=True)
+        qr.print_ascii(invert=True)
+        _LOGIN_CONSOLE.print()
+    except ImportError:
+        _LOGIN_CONSOLE.print()
+        _LOGIN_CONSOLE.print(Panel.fit(Text(url), title="Open with Feishu or Lark", border_style="cyan"))
+        _LOGIN_CONSOLE.print()
+
+
+def _qr_register_inner(
+    *,
+    initial_domain: str,
+) -> dict | None:
+    """Run init → begin → poll. Raises on network/protocol errors."""
+    _LOGIN_CONSOLE.print("[cyan]Preparing Feishu/Lark login...[/cyan]")
+    _init_registration(initial_domain)
+    begin = _begin_registration(initial_domain)
+
+    _print_qr_code(begin["qr_url"])
+
+    with _LOGIN_CONSOLE.status("Waiting for authorization in Feishu/Lark...", spinner="dots"):
+        return _poll_registration(
+            device_code=begin["device_code"],
+            interval=begin["interval"],
+            expire_in=begin["expire_in"],
+            domain=initial_domain,
+        )
+
+
 _STREAM_ELEMENT_ID = "streaming_md"
+_NEW_SESSION_DIVIDER_CONTENT = json.dumps({
+    "type": "divider",
+    "params": {"divider_text": {"text": "New session started."}},
+})
 
 
 @dataclass
@@ -297,21 +872,72 @@ class FeishuChannel(BaseChannel):
         return FeishuConfig().model_dump(by_alias=True)
 
     def __init__(self, config: Any, bus: MessageBus):
-        import lark_oapi as lark
-
         if isinstance(config, dict):
             config = FeishuConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: FeishuConfig = config
-        self._client: lark.Client = None
+        self._client: Any = None
         self._ws_client: Any = None
-        self._ws_thread: threading.Thread | None = None
+        self._ws_runner = get_feishu_ws_runner()
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
         self._bot_open_id: str | None = None
         self._background_tasks: set[asyncio.Task] = set()
         self._reaction_ids: dict[str, str] = {}  # message_id → reaction_id
+
+    # ------------------------------------------------------------------
+    # QR login — writes credentials directly to config.json
+    # ------------------------------------------------------------------
+
+    async def login(self, force: bool = False) -> bool:
+        """Perform QR code scan-to-create login for Feishu/Lark.
+
+        Uses the Feishu device-code registration flow to create a new bot
+        application automatically.  Opens a URL for the user to authorize
+        with the Feishu or Lark mobile app.
+
+        On success, writes ``appId``, ``appSecret``, and ``domain`` to
+        ``channels.feishu`` in ``config.json`` and sets ``enabled: true``.
+
+        Args:
+            force: If True, clear existing credentials and force re-authentication.
+
+        Returns True on success.
+        """
+        if force:
+            self.config.app_id = ""
+            self.config.app_secret = ""
+
+        if self.config.app_id and self.config.app_secret:
+            _LOGIN_CONSOLE.print("[green]Feishu/Lark is already authenticated.[/green]")
+            _LOGIN_CONSOLE.print("Use --force to re-authenticate with a new bot.\n")
+            return True
+
+        _LOGIN_CONSOLE.print("Authorize with the mobile app. nanobot will save the new bot credentials.\n")
+
+        result = qr_register(initial_domain=self.config.domain or "feishu")
+        if not result:
+            _LOGIN_CONSOLE.print(
+                "[yellow]Login was not completed.[/yellow] "
+                "Run 'nanobot channels login feishu --force' to retry."
+            )
+            return False
+
+        self.config.app_id = result["app_id"]
+        self.config.app_secret = result["app_secret"]
+        self.config.domain = result.get("domain", "feishu")
+
+        save_registration_result(
+            result,
+            instance_id=self.config.instance_id,
+            name=self.config.name,
+        )
+
+        _LOGIN_CONSOLE.print("\n[green]Feishu/Lark login complete.[/green]")
+        _LOGIN_CONSOLE.print(f"App ID: {escape(result['app_id'])}")
+        _LOGIN_CONSOLE.print(f"Domain: {escape(self.config.domain)}")
+        return True
 
     @staticmethod
     def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
@@ -322,14 +948,29 @@ class FeishuChannel(BaseChannel):
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
         if not FEISHU_AVAILABLE:
-            self.logger.error("SDK not installed. Run: pip install lark-oapi")
+            self.logger.error("SDK not installed. Run: nanobot plugins enable feishu")
             return
 
         if not self.config.app_id or not self.config.app_secret:
-            self.logger.error("app_id and app_secret not configured")
+            self.logger.error(
+                "app_id and app_secret not configured. "
+                "Run 'nanobot channels login feishu' to set up via QR code."
+            )
             return
 
-        import lark_oapi as lark
+        if sync_saved_feishu_identity_boundary(
+            instance_id=self.config.instance_id,
+            app_id=self.config.app_id,
+            domain=self.config.domain,
+        ):
+            self.config.identity_key = _feishu_app_identity_key(self.config.app_id, self.config.domain)
+            self.config.allow_from = []
+            self.logger.info(
+                "Feishu app identity changed for {}; cleared paired users for this assistant",
+                self.name,
+            )
+
+        lark, feishu_domain, lark_domain = await asyncio.to_thread(_load_lark_runtime)
 
         redirect_lib_logging("Lark")
 
@@ -337,7 +978,7 @@ class FeishuChannel(BaseChannel):
         self._loop = asyncio.get_running_loop()
 
         # Create Lark client for sending messages
-        domain = LARK_DOMAIN if self.config.domain == "lark" else FEISHU_DOMAIN
+        domain = lark_domain if self.config.domain == "lark" else feishu_domain
         self._client = (
             lark.Client.builder()
             .app_id(self.config.app_id)
@@ -387,33 +1028,7 @@ class FeishuChannel(BaseChannel):
             log_level=lark.LogLevel.INFO,
         )
 
-        # Start WebSocket client in a separate thread with reconnect loop.
-        # A dedicated event loop is created for this thread so that lark_oapi's
-        # module-level `loop = asyncio.get_event_loop()` picks up an idle loop
-        # instead of the already-running main asyncio loop, which would cause
-        # "This event loop is already running" errors.
-        def run_ws():
-            import time
-
-            import lark_oapi.ws.client as _lark_ws_client
-
-            ws_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(ws_loop)
-            # Patch the module-level loop used by lark's ws Client.start()
-            _lark_ws_client.loop = ws_loop
-            try:
-                while self._running:
-                    try:
-                        self._ws_client.start()
-                    except Exception as e:
-                        self.logger.warning("WebSocket error: {}", e)
-                    if self._running:
-                        time.sleep(5)
-            finally:
-                ws_loop.close()
-
-        self._ws_thread = threading.Thread(target=run_ws, daemon=True)
-        self._ws_thread.start()
+        await self._ws_runner.start_client(self.name, self._ws_client)
 
         # Fetch bot's own open_id for accurate @mention matching
         self._bot_open_id = await asyncio.get_running_loop().run_in_executor(
@@ -440,6 +1055,7 @@ class FeishuChannel(BaseChannel):
         Reference: https://github.com/larksuite/oapi-sdk-python/blob/v2_main/lark_oapi/ws/client.py#L86
         """
         self._running = False
+        await self._ws_runner.stop_client(self.name)
         self.logger.info("bot stopped")
 
     def _fetch_bot_open_id(self) -> str | None:
@@ -1226,12 +1842,94 @@ class FeishuChannel(BaseChannel):
                     response.msg,
                     response.get_log_id(),
                 )
+                if msg_type == "interactive":
+                    return self._reply_interactive_fallback_sync(
+                        parent_message_id,
+                        content,
+                        reply_in_thread=reply_in_thread,
+                    )
                 return False
             self.logger.debug("reply sent to message {}", parent_message_id)
             return True
         except Exception:
             self.logger.exception("Error replying to message {}", parent_message_id)
+            if msg_type == "interactive":
+                return self._reply_interactive_fallback_sync(
+                    parent_message_id,
+                    content,
+                    reply_in_thread=reply_in_thread,
+                )
             return False
+
+    @staticmethod
+    def _interactive_content_to_text(content: str) -> str | None:
+        try:
+            payload = json.loads(content)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        parts = [part.strip() for part in _extract_interactive_content(payload) if part.strip()]
+        text = "\n".join(parts).strip()
+        return text or None
+
+    @staticmethod
+    def _fallback_text_chunks(text: str, limit: int = 3500) -> list[str]:
+        text = text.strip()
+        if not text:
+            return []
+        chunks: list[str] = []
+        remaining = text
+        while remaining:
+            if len(remaining) <= limit:
+                chunks.append(remaining)
+                break
+            split_at = remaining.rfind("\n", 0, limit)
+            if split_at < limit // 2:
+                split_at = limit
+            chunks.append(remaining[:split_at].strip())
+            remaining = remaining[split_at:].strip()
+        return [chunk for chunk in chunks if chunk]
+
+    def _reply_interactive_fallback_sync(
+        self,
+        parent_message_id: str,
+        content: str,
+        *,
+        reply_in_thread: bool = False,
+    ) -> bool:
+        text = self._interactive_content_to_text(content)
+        if not text:
+            return False
+        sent = False
+        for chunk in self._fallback_text_chunks(text):
+            body = json.dumps({"text": chunk}, ensure_ascii=False)
+            sent = self._reply_message_sync(
+                parent_message_id,
+                "text",
+                body,
+                reply_in_thread=reply_in_thread,
+            ) or sent
+        if sent:
+            self.logger.warning("Sent Feishu interactive reply as text fallback")
+        return sent
+
+    def _send_interactive_fallback_sync(
+        self,
+        receive_id_type: str,
+        receive_id: str,
+        content: str,
+    ) -> str | None:
+        text = self._interactive_content_to_text(content)
+        if not text:
+            return None
+        last_message_id: str | None = None
+        for chunk in self._fallback_text_chunks(text):
+            body = json.dumps({"text": chunk}, ensure_ascii=False)
+            message_id = self._send_message_sync(receive_id_type, receive_id, "text", body)
+            if message_id:
+                last_message_id = message_id
+        if last_message_id:
+            self.logger.warning("Sent Feishu interactive message as text fallback")
+        return last_message_id
 
     def _should_use_reply_in_thread(self, metadata: dict[str, Any]) -> bool:
         """Return whether a group reply should create a Feishu thread/topic."""
@@ -1276,6 +1974,12 @@ class FeishuChannel(BaseChannel):
                     response.msg,
                     response.get_log_id(),
                 )
+                if msg_type == "interactive":
+                    return self._send_interactive_fallback_sync(
+                        receive_id_type,
+                        receive_id,
+                        content,
+                    )
                 return None
             msg_id = getattr(response.data, "message_id", None)
             self.logger.debug("{} message sent to {}: {}", msg_type, receive_id, msg_id)
@@ -1383,16 +2087,11 @@ class FeishuChannel(BaseChannel):
             self.logger.warning("Error stream-updating card {}: {}", card_id, e)
             return False
 
-    def _close_streaming_mode_sync(self, card_id: str, sequence: int) -> bool:
-        """Turn off CardKit streaming_mode so the chat list preview exits the streaming placeholder.
-
-        Per Feishu docs, streaming cards keep a generating-style summary in the session list until
-        streaming_mode is set to false via card settings (after final content update).
-        Sequence must strictly exceed the previous card OpenAPI operation on this entity.
-        """
+    def _set_streaming_mode_sync(self, card_id: str, enabled: bool, sequence: int) -> bool:
+        """Set CardKit streaming_mode using a strictly increasing sequence."""
         from lark_oapi.api.cardkit.v1 import SettingsCardRequest, SettingsCardRequestBody
 
-        settings_payload = json.dumps({"config": {"streaming_mode": False}}, ensure_ascii=False)
+        settings_payload = json.dumps({"config": {"streaming_mode": enabled}}, ensure_ascii=False)
         try:
             request = (
                 SettingsCardRequest.builder()
@@ -1409,7 +2108,8 @@ class FeishuChannel(BaseChannel):
             response = self._client.cardkit.v1.card.settings(request)
             if not response.success():
                 self.logger.warning(
-                    "Failed to close streaming on card {}: code={}, msg={}",
+                    "Failed to set streaming={} on card {}: code={}, msg={}",
+                    enabled,
                     card_id,
                     response.code,
                     response.msg,
@@ -1417,18 +2117,46 @@ class FeishuChannel(BaseChannel):
                 return False
             return True
         except Exception as e:
-            self.logger.warning("Error closing streaming on card {}: {}", card_id, e)
+            self.logger.warning("Error setting streaming={} on card {}: {}", enabled, card_id, e)
             return False
 
+    def _close_streaming_mode_sync(self, card_id: str, sequence: int) -> bool:
+        """Turn off CardKit streaming_mode so the chat list preview exits the streaming placeholder.
+
+        Per Feishu docs, streaming cards keep a generating-style summary in the session list until
+        streaming_mode is set to false via card settings (after final content update).
+        Sequence must strictly exceed the previous card OpenAPI operation on this entity.
+        """
+        return self._set_streaming_mode_sync(card_id, False, sequence)
+
+    def _stream_update_text_with_reopen_sync(
+        self,
+        card_id: str,
+        content: str,
+        sequence: int,
+    ) -> tuple[bool, int]:
+        if self._stream_update_text_sync(card_id, content, sequence):
+            return True, sequence
+        sequence += 1
+        if not self._set_streaming_mode_sync(card_id, True, sequence):
+            return False, sequence
+        sequence += 1
+        return self._stream_update_text_sync(card_id, content, sequence), sequence
+
     async def send_delta(
-        self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None
+        self,
+        chat_id: str,
+        delta: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        stream_id: str | None = None,
+        stream_end: bool = False,
+        resuming: bool = False,
     ) -> None:
         """Progressive streaming via CardKit: create card on first delta, stream-update on subsequent.
 
         Supported metadata keys:
-            _stream_end: Finalize the streaming card.
-            _tool_hint:  Delta is a formatted tool hint (for display only).
-            message_id:  Original message id (used with _stream_end for reaction cleanup).
+            message_id:  Original message id (used with stream end for reaction cleanup).
             chat_type:   "group" or "p2p" — controls reply-in-thread for streaming cards.
         """
         if not self._client:
@@ -1439,14 +2167,14 @@ class FeishuChannel(BaseChannel):
         rid_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
 
         # --- stream end: final update or fallback ---
-        if meta.get("_stream_end"):
+        if stream_end:
             message_id = meta.get("message_id")
             # Only finalize the OnIt -> DONE reaction transition on the truly
-            # final stream end. _resuming=True means the agent will keep
+            # final stream end. resuming=True means the agent will keep
             # working (more tool-call rounds), so leave the reaction state
             # in place — otherwise the OnIt indicator disappears prematurely
             # and the DONE reaction fires after every tool call.
-            if message_id and not meta.get("_resuming"):
+            if message_id and not resuming:
                 reaction_id = self._reaction_ids.pop(message_id, None)
                 if reaction_id:
                     await self._remove_reaction(message_id, reaction_id)
@@ -1462,22 +2190,37 @@ class FeishuChannel(BaseChannel):
             # back to sending a regular interactive card.
             if buf.card_id:
                 buf.sequence += 1
-                ok = await loop.run_in_executor(
+                ok, buf.sequence = await loop.run_in_executor(
                     None,
-                    self._stream_update_text_sync,
+                    self._stream_update_text_with_reopen_sync,
                     buf.card_id,
                     buf.text,
                     buf.sequence,
                 )
                 if ok:
                     buf.sequence += 1
-                    await loop.run_in_executor(
+                    closed = await loop.run_in_executor(
                         None,
                         self._close_streaming_mode_sync,
                         buf.card_id,
                         buf.sequence,
                     )
+                    if not closed:
+                        buf.sequence += 1
+                        await loop.run_in_executor(
+                            None,
+                            self._close_streaming_mode_sync,
+                            buf.card_id,
+                            buf.sequence,
+                        )
                     return
+                buf.sequence += 1
+                await loop.run_in_executor(
+                    None,
+                    self._close_streaming_mode_sync,
+                    buf.card_id,
+                    buf.sequence,
+                )
                 self.logger.warning(
                     "Streaming card {} final update failed, falling back to regular card",
                     buf.card_id,
@@ -1530,18 +2273,36 @@ class FeishuChannel(BaseChannel):
                 ),
             )
             if card_id:
-                buf.card_id = card_id
-                buf.sequence = 1
-                await loop.run_in_executor(
-                    None, self._stream_update_text_sync, card_id, buf.text, 1
+                ok, sequence = await loop.run_in_executor(
+                    None, self._stream_update_text_with_reopen_sync, card_id, buf.text, 1
                 )
-                buf.last_edit = now
+                if ok:
+                    buf.card_id = card_id
+                    buf.sequence = sequence
+                    buf.last_edit = now
+                else:
+                    await loop.run_in_executor(
+                        None, self._close_streaming_mode_sync, card_id, sequence + 1
+                    )
         elif (now - buf.last_edit) >= self._STREAM_EDIT_INTERVAL:
-            buf.sequence += 1
-            await loop.run_in_executor(
-                None, self._stream_update_text_sync, buf.card_id, buf.text, buf.sequence
+            ok, buf.sequence = await loop.run_in_executor(
+                None,
+                self._stream_update_text_with_reopen_sync,
+                buf.card_id,
+                buf.text,
+                buf.sequence + 1,
             )
-            buf.last_edit = now
+            if ok:
+                buf.last_edit = now
+            else:
+                buf.sequence += 1
+                await loop.run_in_executor(
+                    None,
+                    self._close_streaming_mode_sync,
+                    buf.card_id,
+                    buf.sequence,
+                )
+                buf.card_id = None
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present."""
@@ -1556,7 +2317,9 @@ class FeishuChannel(BaseChannel):
             # Handle tool hint messages.  When a streaming card is active for
             # this chat, inline the hint into the card instead of sending a
             # separate message so the user experience stays cohesive.
-            if msg.metadata.get("_tool_hint"):
+            progress_event = msg.event if isinstance(msg.event, ProgressEvent) else None
+
+            if progress_event and progress_event.tool_hint:
                 hint = (msg.content or "").strip()
                 if not hint:
                     return
@@ -1567,6 +2330,7 @@ class FeishuChannel(BaseChannel):
                     await self.send_delta(
                         msg.chat_id,
                         "\n\n" + self._format_tool_hint_delta(hint) + "\n\n",
+                        metadata=msg.metadata,
                     )
                     return
                 # No active streaming card — send as a regular interactive card
@@ -1592,6 +2356,14 @@ class FeishuChannel(BaseChannel):
                     )
                 return
 
+            if (
+                msg.content.strip() == "New session started."
+                and msg.metadata.get("chat_type") == "p2p"
+                and not msg.media
+                and not msg.buttons
+            ):
+                return
+
             # Determine whether the first message should quote the user's message.
             # Only the very first send (media or text) in this call uses reply; subsequent
             # chunks/media fall back to plain create to avoid redundant quote bubbles.
@@ -1600,7 +2372,7 @@ class FeishuChannel(BaseChannel):
             reply_message_id: str | None = None
             _msg_id = msg.metadata.get("message_id")
             has_thread_id = msg.metadata.get("thread_id")
-            if self.config.reply_to_message and not msg.metadata.get("_progress", False):
+            if self.config.reply_to_message and progress_event is None:
                 reply_message_id = _msg_id
             # For topic group messages, always reply to keep context in thread
             elif has_thread_id:
@@ -1704,11 +2476,15 @@ class FeishuChannel(BaseChannel):
         Sync handler for incoming messages (called from WebSocket thread).
         Schedules async handling in the main event loop.
         """
+        if not self._running:
+            return
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
 
     async def _on_message(self, data: P2ImMessageReceiveV1) -> None:
         """Handle incoming message from Feishu."""
+        if not self._running:
+            return
         try:
             event = data.event
             message = event.message
@@ -1842,15 +2618,26 @@ class FeishuChannel(BaseChannel):
             if not content and not media_paths:
                 return
 
+            if chat_type == "p2p" and normalize_command_text(content).lower() == "/new":
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    self._send_message_sync,
+                    "open_id",
+                    sender_id,
+                    "system",
+                    _NEW_SESSION_DIVIDER_CONTENT,
+                )
+
             # Build session key for conversation isolation.
             # If topic_isolation is True: each topic gets its own session via root_id/message_id.
             # If topic_isolation is False: all messages in group share the same session.
             # Private chat: no override — same behavior as Telegram/Slack.
             if chat_type == "group":
                 if self.config.topic_isolation:
-                    session_key = f"feishu:{chat_id}:{root_id or message_id}"
+                    session_key = f"{self.name}:{chat_id}:{root_id or message_id}"
                 else:
-                    session_key = f"feishu:{chat_id}"
+                    session_key = f"{self.name}:{chat_id}"
             else:
                 session_key = None
 

@@ -19,6 +19,16 @@ from pydantic.alias_generators import to_snake
 
 
 @dataclass(frozen=True)
+class ProviderModelSpec:
+    """A curated model exposed by providers without a model-list endpoint."""
+
+    id: str
+    label: str = ""
+    description: str = ""
+    context_window: int | None = None
+
+
+@dataclass(frozen=True)
 class ProviderSpec:
     """One LLM provider's metadata. See PROVIDERS below for real examples.
 
@@ -32,13 +42,17 @@ class ProviderSpec:
     keywords: tuple[str, ...]  # model-name keywords for matching (lowercase)
     env_key: str  # env var for API key, e.g. "DASHSCOPE_API_KEY"
     display_name: str = ""  # shown in `nanobot status`
+    model_catalog: str = "auto"  # WebUI model-list source
+    builtin_models: tuple[ProviderModelSpec, ...] = ()
+    settings_alias_for: str = ""  # compatibility alias grouped under this provider in Settings
 
     # which provider implementation to use
     # "openai_compat" | "anthropic" | "azure_openai" | "openai_codex" | "github_copilot" | "bedrock"
     backend: str = "openai_compat"
 
-    # extra env vars, e.g. (("ZHIPUAI_API_KEY", "{api_key}"),)
+    # extra env vars / request headers supplied by the provider integration.
     env_extras: tuple[tuple[str, str], ...] = ()
+    default_extra_headers: tuple[tuple[str, str], ...] = ()
 
     # gateway / local detection
     is_gateway: bool = False  # routes any model (OpenRouter, AiHubMix)
@@ -49,6 +63,7 @@ class ProviderSpec:
 
     # gateway behavior
     strip_model_prefix: bool = False  # strip "provider/" before sending to gateway
+    strip_model_prefixes: tuple[str, ...] = ()  # strip only when the first model segment matches
     supports_max_completion_tokens: bool = False
 
     # per-model param overrides, e.g. (("kimi-k2.5", {"temperature": 1.0}),)
@@ -83,6 +98,29 @@ class ProviderSpec:
     # when "content" is empty.  Only set this for providers (e.g. StepFun)
     # whose API returns the actual answer in "reasoning" instead of "content".
     reasoning_as_content: bool = False
+
+    # Map user-supplied reasoning_effort (OpenAI vocab: minimal/low/medium/high)
+    # to the value this provider accepts on the wire. Set when the provider's
+    # accepted set differs from OpenAI's. An empty mapped value omits the kwarg.
+    # Mistral: only "high"/"none" — low/minimal map to "none", medium maps to "high".
+    reasoning_effort_remap: tuple[tuple[str, str], ...] = ()
+
+    # Models whose API rejects the reasoning_effort kwarg because reasoning is
+    # implicit (Magistral always reasons; sending the kwarg returns HTTP 400).
+    # Substring match against the wire model name (lowercased).
+    implicit_reasoning_models: tuple[str, ...] = ()
+
+    # When the model returns content as a list of {"type":"thinking",...} +
+    # {"type":"text",...} blocks, extract the thinking text into
+    # reasoning_content. Mistral's Magistral / reasoning-enabled responses use
+    # this shape.
+    extract_thinking_blocks: bool = False
+
+    # Strip ``reasoning_content`` from assistant history messages before
+    # sending. Mistral validates its request schema strictly and 400s on
+    # any extra fields; other providers (DeepSeek) require this key on the
+    # wire to keep thinking-mode history intact.
+    strip_history_reasoning_content: bool = False
 
     @property
     def label(self) -> str:
@@ -152,6 +190,46 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         supports_prompt_caching=True,
         gateway_reasoning_style="reasoning_effort",
     ),
+    # OpenCode Zen: OpenAI-compatible chat-completions gateway for coding models.
+    # models.dev/OpenCode use provider id "opencode" and model ids like
+    # "opencode/<model>"; send the bare model upstream.
+    ProviderSpec(
+        name="opencode",
+        keywords=("opencode/", "opencode", "opencode-zen", "opencode_zen"),
+        env_key="OPENCODE_API_KEY",
+        display_name="OpenCode Zen",
+        backend="openai_compat",
+        is_gateway=True,
+        detect_by_base_keyword="opencode.ai/zen",
+        default_api_base="https://opencode.ai/zen/v1",
+        strip_model_prefixes=("opencode", "opencode_zen", "opencode-zen"),
+    ),
+    # Compatibility alias for configs that already used providers.opencodeZen.
+    ProviderSpec(
+        name="opencode_zen",
+        keywords=("opencode/", "opencode_zen", "opencode-zen"),
+        env_key="OPENCODE_API_KEY",
+        display_name="OpenCode Zen",
+        settings_alias_for="opencode",
+        backend="openai_compat",
+        is_gateway=True,
+        detect_by_base_keyword="opencode.ai/zen",
+        default_api_base="https://opencode.ai/zen/v1",
+        strip_model_prefixes=("opencode", "opencode_zen", "opencode-zen"),
+    ),
+    # OpenCode Go: OpenAI-compatible chat-completions gateway for low-cost models.
+    # OpenCode's own config uses "opencode-go/<model>"; send the bare model upstream.
+    ProviderSpec(
+        name="opencode_go",
+        keywords=("opencode-go", "opencode_go"),
+        env_key="OPENCODE_API_KEY",
+        display_name="OpenCode Go",
+        backend="openai_compat",
+        is_gateway=True,
+        detect_by_base_keyword="opencode.ai/zen/go",
+        default_api_base="https://opencode.ai/zen/go/v1",
+        strip_model_prefixes=("opencode-go", "opencode_go"),
+    ),
     # Hugging Face Inference Providers: OpenAI-compatible router for chat models.
     ProviderSpec(
         name="huggingface",
@@ -170,6 +248,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         keywords=("skywork", "skyclaw", "apifree"),
         env_key="SKYWORK_API_KEY",
         display_name="Skywork",
+        model_catalog="official",
         backend="openai_compat",
         env_extras=(("APIFREE_API_KEY", "{api_key}"),),
         is_gateway=True,
@@ -295,6 +374,47 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         keywords=("openai-codex",),
         env_key="",
         display_name="OpenAI Codex",
+        model_catalog="builtin",
+        builtin_models=(
+            ProviderModelSpec(
+                id="openai-codex/gpt-5.6-sol",
+                label="GPT-5.6-Sol",
+                description="Latest frontier agentic coding model.",
+                context_window=372000,
+            ),
+            ProviderModelSpec(
+                id="openai-codex/gpt-5.6-terra",
+                label="GPT-5.6-Terra",
+                description="Balanced agentic coding model for everyday work.",
+                context_window=372000,
+            ),
+            ProviderModelSpec(
+                id="openai-codex/gpt-5.6-luna",
+                label="GPT-5.6-Luna",
+                description="Fast and affordable agentic coding model.",
+                context_window=372000,
+            ),
+            ProviderModelSpec(
+                id="openai-codex/gpt-5.5",
+                label="GPT-5.5",
+                description="Frontier model for complex coding, research, and real-world work.",
+            ),
+            ProviderModelSpec(
+                id="openai-codex/gpt-5.4",
+                label="GPT-5.4",
+                description="Strong model for everyday coding.",
+            ),
+            ProviderModelSpec(
+                id="openai-codex/gpt-5.4-mini",
+                label="GPT-5.4-Mini",
+                description="Small, fast, and cost-efficient model for simpler coding tasks.",
+            ),
+            ProviderModelSpec(
+                id="openai-codex/gpt-5.3-codex-spark",
+                label="GPT-5.3-Codex-Spark",
+                description="Ultra-fast coding model.",
+            ),
+        ),
         backend="openai_codex",
         detect_by_base_keyword="codex",
         default_api_base="https://chatgpt.com/backend-api",
@@ -351,7 +471,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
         thinking_style="enable_thinking",
     ),
-    # Moonshot (月之暗面): Kimi K2.5 / K2.6 enforce temperature >= 1.0.
+    # Moonshot (月之暗面): Kimi K2.5+ enforce temperature >= 1.0.
     ProviderSpec(
         name="moonshot",
         keywords=("moonshot", "kimi"),
@@ -362,7 +482,21 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(
             ("kimi-k2.5", {"temperature": 1.0}),
             ("kimi-k2.6", {"temperature": 1.0}),
+            ("kimi-k2.7", {"temperature": 1.0}),
+            ("kimi-k2.7-code", {"temperature": 1.0}),
+            ("kimi-k2.7-code-highspeed", {"temperature": 1.0}),
         ),
+    ),
+    # Kimi Coding Plan — Anthropic Messages API at api.kimi.com/coding
+    # sk-kimi-* keys; requires User-Agent: claude-code/0.1.0 header.
+    ProviderSpec(
+        name="kimi_coding",
+        keywords=("kimi-coding", "kimi_coding", "kimi-for-coding"),
+        env_key="KIMI_CODING_API_KEY",
+        display_name="Kimi Coding",
+        backend="anthropic",
+        default_api_base="https://api.kimi.com/coding/v1",
+        default_extra_headers=(("User-Agent", "claude-code/0.1.0"),),
     ),
     # MiniMax: OpenAI-compatible API
     ProviderSpec(
@@ -383,14 +517,30 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="anthropic",
         default_api_base="https://api.minimax.io/anthropic",
     ),
-    # Mistral AI: OpenAI-compatible API
+    # Mistral AI: OpenAI-compatible API.
+    # Reasoning quirks:
+    #   * mistral-medium-3-5 / mistral-vibe-cli-* accept reasoning_effort but
+    #     only "high" or "none" — low/medium/minimal must be remapped.
+    #   * Magistral-* models reason implicitly and reject the kwarg entirely.
+    #   * Reasoning responses return content as a list of thinking + text
+    #     blocks; thinking text gets extracted into reasoning_content.
     ProviderSpec(
         name="mistral",
-        keywords=("mistral",),
+        keywords=("mistral", "magistral", "ministral", "codestral", "devstral"),
         env_key="MISTRAL_API_KEY",
         display_name="Mistral",
         backend="openai_compat",
         default_api_base="https://api.mistral.ai/v1",
+        reasoning_effort_remap=(
+            ("minimal", "none"),
+            ("low", "none"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("none", "none"),
+        ),
+        implicit_reasoning_models=("magistral",),
+        extract_thinking_blocks=True,
+        strip_history_reasoning_content=True,
     ),
     # Step Fun (阶跃星辰): OpenAI-compatible API
     ProviderSpec(
@@ -545,3 +695,19 @@ def find_by_name(name: str) -> ProviderSpec | None:
         if spec.name == normalized:
             return spec
     return None
+
+
+def create_dynamic_spec(name: str, *, thinking_style: str = "") -> ProviderSpec:
+    """Create a dynamic ProviderSpec for custom user-defined providers."""
+    normalized = to_snake(name.replace("-", "_"))
+    strip_prefixes = tuple(dict.fromkeys((name, normalized)))
+    return ProviderSpec(
+        name=normalized,
+        keywords=(),
+        env_key="",
+        display_name=name.title(),
+        backend="openai_compat",
+        is_direct=True,
+        strip_model_prefixes=strip_prefixes,
+        thinking_style=thinking_style,
+    )

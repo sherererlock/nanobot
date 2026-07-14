@@ -10,7 +10,12 @@ from loguru import logger
 if TYPE_CHECKING:
     from nanobot.channels.base import BaseChannel
 
-_INTERNAL = frozenset({"base", "manager", "registry"})
+_INTERNAL = frozenset({
+    "base",
+    "manager",
+    "registry",
+})
+DEFAULT_ENABLED_CHANNELS = frozenset({"websocket"})
 
 
 def discover_channel_names() -> list[str]:
@@ -20,7 +25,7 @@ def discover_channel_names() -> list[str]:
     return [
         name
         for _, name, ispkg in pkgutil.iter_modules(pkg.__path__)
-        if name not in _INTERNAL and not ispkg
+        if name not in _INTERNAL and not name.startswith("_") and not ispkg
     ]
 
 
@@ -57,6 +62,7 @@ def discover_enabled(
     *,
     _names: list[str] | None = None,
     _include_all_external: bool = False,
+    warn_import_errors: bool = False,
 ) -> dict[str, type[BaseChannel]]:
     """Return channels whose module names are in *enabled_names*.
 
@@ -72,10 +78,14 @@ def discover_enabled(
         try:
             result[modname] = load_channel_class(modname)
         except ImportError as e:
-            logger.debug("Skipping built-in channel '{}': {}", modname, e)
+            message = "Enabled built-in channel '{}' is not available: {}"
+            if warn_import_errors:
+                logger.warning(message, modname, e)
+            else:
+                logger.debug(message, modname, e)
 
     external = discover_plugins(None if _include_all_external else enabled_names)
-    shadowed = set(external) & set(result)
+    shadowed = set(external) & set(names)
     if shadowed:
         logger.warning("Plugin(s) shadowed by built-in channels (ignored): {}", shadowed)
     if _include_all_external:

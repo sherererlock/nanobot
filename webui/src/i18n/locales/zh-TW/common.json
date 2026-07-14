@@ -55,6 +55,7 @@
       "ariaLabel": "切換語言"
     },
     "apps": "應用",
+    "automations": "自動任務",
     "skills": {
       "title": "技能"
     }
@@ -75,17 +76,20 @@
       "image": "圖片",
       "voice": "語音",
       "browser": "網頁",
+      "channels": "渠道",
       "runtime": "系統",
       "advanced": "安全",
       "cliApps": "CLI 應用",
       "mcp": "MCP",
       "apps": "應用",
+      "automations": "自動任務",
       "skills": "技能"
     },
     "sections": {
       "interface": "介面",
       "ai": "AI",
       "system": "系統",
+      "about": "關於",
       "status": "狀態",
       "localPreferences": "本機偏好",
       "presets": "預設",
@@ -118,6 +122,7 @@
       "presetModel": "預設模型",
       "density": "密度",
       "activityMode": "活動細節",
+      "fileEditDisplay": "檔案編輯顯示",
       "codeWrap": "程式碼換行",
       "maxResults": "最大結果數",
       "timeout": "逾時",
@@ -162,6 +167,7 @@
       "presetModel": "切回 Default 後可在 WebUI 中編輯模型與供應商。",
       "density": "只儲存在此瀏覽器中。",
       "activityMode": "選擇預設顯示多少 agent 活動細節。",
+      "fileEditDisplay": "選擇檔案編輯活動預設顯示行數或差異。",
       "codeWrap": "讓長程式碼行在小螢幕上也易讀。",
       "maxResults": "每次 web_search 呼叫返回的結果數。",
       "timeout": "搜尋供應商請求逾時前的秒數。",
@@ -211,6 +217,9 @@
       "compact": "緊湊",
       "auto": "自動",
       "expanded": "展開",
+      "summary": "摘要",
+      "diff": "差異",
+      "collapsedDiff": "摺疊差異",
       "on": "開啟",
       "off": "關閉",
       "defaultPermission": "預設權限",
@@ -391,6 +400,13 @@
       "unavailable": "不可用",
       "noDescription": "暫無描述。"
     },
+    "about": {
+      "version": "版本",
+      "checking": "正在檢查...",
+      "checkForUpdates": "檢查更新",
+      "upToDate": "已是最新版本",
+      "updateAvailable": "有可用更新 v{{version}}"
+    },
     "mcp": {
       "allCategories": "全部分類",
       "summary": "已啟用 {{installed}} / {{total}} 個預設",
@@ -444,22 +460,204 @@
       "noTools": "無",
       "testForTools": "執行測試以檢查並選擇個別工具。"
     },
+    "api": {
+      "title": "API 服務", "openaiCompatible": "OpenAI 相容 API", "description": "讓 SDK 和其他 Agent 透過本機 /v1 介面連接 nanobot。",
+      "start": "啟動 API 服務", "starting": "正在啟動...", "stop": "停止", "stopping": "正在停止...",
+      "access": "存取範圍", "thisDevice": "僅此裝置", "localNetwork": "區域網路",
+      "localHelp": "只有目前裝置可以連接。", "networkHelp": "區域網路內其他裝置可以連接，因此必須設定 API Key。",
+      "port": "連接埠", "portHelp": "API 服務使用的本機連接埠。", "apiKey": "API Key", "apiKeyHelp": "用戶端使用 Bearer Token 傳送此金鑰。",
+      "apiKeyRequired": "向區域網路開放 API 前必須設定金鑰。", "apiKeyPlaceholder": "輸入 API Key",
+      "autoInstall": "啟動時會自動安裝 API 支援。"
+    },
+    "observability": {
+      "title": "可觀測性", "configured": "nanobot 已偵測到追蹤憑證。",
+      "environment": "設定 LANGFUSE_SECRET_KEY 和 LANGFUSE_PUBLIC_KEY 後重新啟動 nanobot。", "enable": "啟用追蹤支援"
+    },
     "legal": {
       "thirdPartyBrands": "產品名稱、標誌與品牌均屬於其各自擁有者。使用僅為識別用途，並不代表背書。"
     },
     "apps": {
-      "description": "新增 nanobot 可在聊天中使用的 App CLI 和 MCP 服務。",
-      "cliLabel": "CLI",
-      "mcpLabel": "MCP",
-      "filterAll": "全部",
-      "filterCli": "CLI 應用",
-      "filterMcp": "MCP 服務",
-      "enabledSummary": "已啟用 {{count}} 個",
-      "caption": "{{cli}} 個 CLI · {{mcp}} 個 MCP",
+      "description": "把工具連接到 nanobot，然後在對話中使用 @。",
+      "cliLabel": "應用",
+      "mcpLabel": "整合",
+      "channelLabel": "通道",
+      "featureLabel": "能力",
+      "filterAll": "可用",
+      "filterPlugins": "插件",
+      "filterCli": "應用",
+      "filterMcp": "整合",
+      "enabledSummary": "{{count}} 個可用",
+      "caption": "{{cli}} 個應用 · {{mcp}} 個整合",
       "searchPlaceholder": "搜尋應用",
-      "featured": "精選",
+      "featured": "工具",
       "loading": "正在載入應用...",
-      "empty": "沒有符合的應用。"
+      "empty": "目前檢視沒有符合的工具。",
+      "restartRequired": "重新啟動 nanobot 以套用更新後的應用和能力。"
+    },
+    "channels": {
+      "description": "把聊天應用、郵箱和 WebUI 連接到 nanobot。",
+      "caption": "{{enabled}} 個已啟用 · 共 {{total}} 個渠道",
+      "searchPlaceholder": "搜尋渠道",
+      "backToChannels": "所有渠道",
+      "catalog": "渠道",
+      "loading": "正在載入渠道...",
+      "empty": "沒有符合的渠道。",
+      "restartRequired": "重新啟動 nanobot 以套用更新後的渠道支援。",
+      "requires": "需要：{{requirements}}",
+      "setUp": "設定",
+      "setupGuide": "設定指南",
+      "setupSummary": "啟用只會打開 nanobot 的渠道支援。請補充平台憑證，然後重新啟動 nanobot。",
+      "configKeys": "設定欄位",
+      "enable": "啟用渠道",
+      "disable": "停用渠道",
+      "needsConfig": "需要設定",
+      "connect": "連接",
+      "reconnect": "重新連接",
+      "feishuQrAlt": "飛書連接二維碼",
+      "feishuScanTitle": "使用飛書掃碼",
+      "feishuScanDescription": "用手機上的飛書或 Lark 掃描二維碼。授權完成後，nanobot 會自動完成設定。",
+      "feishuWaiting": "正在等待授權...",
+      "feishuConnected": "飛書已連接。",
+      "feishuConnectStopped": "連接已停止。",
+      "feishuConnecting": "正在連接..."
+    },
+    "nanobotFeatures": {
+      "enabled": "已啟用",
+      "enable": "啟用",
+      "disable": "停用",
+      "ready": "就緒",
+      "missingDependency": "缺少支援套件",
+      "installSupport": "安裝支援套件",
+      "installConfirmTitle": "安裝 {{name}} 支援？",
+      "installConfirmDescription": "將安裝並啟用 {{name}} 支援。是否繼續？",
+      "installConfirmAction": "安裝並啟用",
+      "websocketRequired": "WebUI 必需",
+      "channelDisabled": "通道已停用",
+      "notEnabled": "未啟用"
+    },
+    "automations": {
+      "filters": {
+        "all": "全部",
+        "active": "執行中",
+        "paused": "已暫停",
+        "failed": "異常",
+        "system": "系統"
+      },
+      "sort": {
+        "next": "下次執行",
+        "last": "上次執行",
+        "updated": "更新時間",
+        "name": "名稱"
+      },
+      "search": "搜尋任務、訊息、關聯對話或排程",
+      "queue": "任務佇列",
+      "loading": "正在載入自動任務...",
+      "noMatches": "目前檢視沒有符合的自動任務。",
+      "empty": "尚無自動任務。",
+      "emptyHint": "請從它應該執行的來源處建立，這樣 nanobot 才能保留正確上下文。",
+      "oneShot": "一次性",
+      "systemTask": "系統管理的自動任務",
+      "localTrigger": "本機觸發器",
+      "labels": {
+        "schedule": "排程",
+        "next": "下次",
+        "origin": "關聯會話",
+        "created": "建立於",
+        "updated": "更新於"
+      },
+      "runNow": "立即執行",
+      "pause": "暫停",
+      "resume": "恢復",
+      "edit": "編輯",
+      "delete": "刪除",
+      "protected": "受保護",
+      "editTitle": "編輯自動任務",
+      "save": "儲存",
+      "deleteTitle": "刪除自動任務",
+      "deleteDescription": "這會從 cron 儲存中刪除 {{name}}，歷史聊天訊息會保留在會話中。",
+      "cancel": "取消",
+      "status": {
+        "system": "系統",
+        "running": "正在執行",
+        "paused": "已暫停",
+        "failed": "失敗",
+        "completed": "已完成",
+        "noSchedule": "無排程",
+        "active": "執行中"
+      },
+      "origin": {
+        "system": "系統",
+        "unknown": "未關聯會話"
+      },
+      "channels": {
+        "api": "API",
+        "cli": "CLI",
+        "dingtalk": "釘釘",
+        "discord": "Discord",
+        "email": "電子郵件",
+        "feishu": "飛書",
+        "matrix": "Matrix",
+        "msteams": "Microsoft Teams",
+        "qq": "QQ",
+        "slack": "Slack",
+        "telegram": "Telegram",
+        "wechat": "微信",
+        "wecom": "企業微信",
+        "weixin": "微信",
+        "whatsapp": "WhatsApp"
+      },
+      "schedule": {
+        "at": "於 {{time}}",
+        "every": "每 {{duration}}",
+        "cron": "Cron {{expr}}",
+        "cronWithTz": "Cron {{expr}} · {{tz}}",
+        "withTz": "{{summary}} · {{tz}}",
+        "dailyAt": "每天 {{time}}",
+        "weekdaysAt": "工作日 {{time}}",
+        "hourlyAt": "每小時第 {{minute}} 分鐘",
+        "hourlyWindow": "{{start}}-{{end}} 點每小時第 {{minute}} 分鐘",
+        "local": "本機觸發器",
+        "custom": "自訂排程"
+      },
+      "next": {
+        "paused": "已暫停",
+        "pending": "正在執行",
+        "local": "等待觸發",
+        "none": "沒有下次執行"
+      },
+      "message": {
+        "showMore": "查看完整訊息",
+        "showLess": "收起訊息"
+      },
+      "fields": {
+        "name": "名稱",
+        "message": "訊息",
+        "scheduleType": "排程類型",
+        "every": "每隔",
+        "unit": "單位",
+        "cronExpression": "Cron 表達式",
+        "timezone": "時區",
+        "runAt": "執行時間"
+      },
+      "scheduleTypes": {
+        "every": "間隔",
+        "cron": "Cron",
+        "at": "一次性"
+      },
+      "everyUnits": {
+        "second": "秒",
+        "minute": "分鐘",
+        "hour": "小時",
+        "day": "天"
+      },
+      "validation": {
+        "nameRequired": "名稱不能為空。",
+        "messageRequired": "訊息不能為空。",
+        "intervalRequired": "間隔必須是正整數。",
+        "cronRequired": "Cron 表達式不能為空。",
+        "timeRequired": "執行時間不能為空。",
+        "futureRequired": "執行時間必須晚於目前時間。"
+      }
     },
     "oauth": {
       "authentication": "OAuth 認證",
@@ -509,6 +707,7 @@
   },
   "chat": {
     "fallbackTitle": "對話 {{id}}",
+    "forkTitle": "分叉：{{title}}",
     "loading": "載入中…",
     "noSessions": "目前還沒有會話。",
     "showMore": "再顯示 {{count}} 個",
@@ -518,7 +717,8 @@
     "newInProject": "在 {{project}} 中開始新對話",
     "activity": {
       "running": "Agent 正在執行",
-      "complete": "Agent 已完成"
+      "complete": "Agent 已完成",
+      "updated": "有新內容"
     },
     "pin": "置頂",
     "unpin": "取消置頂",
@@ -550,7 +750,24 @@
     "title": "刪除這個對話？",
     "description": "此操作無法復原。",
     "cancel": "取消",
-    "confirm": "刪除"
+    "confirm": "刪除",
+    "automationsDescription": "這個對話有關聯的自動任務。刪除對話也會刪除這些自動任務。",
+    "moreAutomations": "另有 {{count}} 個",
+    "confirmWithAutomations": "刪除",
+    "schedule": {
+      "at": "{{time}}",
+      "every": "每 {{duration}}",
+      "cron": "Cron {{expr}}",
+      "cronWithTz": "Cron {{expr}} · {{tz}}",
+      "local": "本機觸發器",
+      "unknown": "自訂計畫"
+    },
+    "next": {
+      "label": "下次：{{time}}",
+      "disabled": "已暫停",
+      "local": "等待觸發",
+      "none": "沒有下次執行"
+    }
   },
   "connection": {
     "idle": "閒置",
@@ -643,11 +860,14 @@
         "every": "每 {{duration}}",
         "cron": "Cron {{expr}}",
         "cronWithTz": "Cron {{expr}} · {{tz}}",
+        "local": "本機觸發器",
         "unknown": "自訂計畫"
       },
       "next": {
         "label": "下次 {{time}}",
+        "pending": "即將執行",
         "disabled": "已暫停",
+        "local": "等待觸發",
         "none": "沒有下次執行"
       }
     },
@@ -675,7 +895,7 @@
         "edit": "編輯引導",
         "drag": "拖曳排序"
       },
-      "attachImage": "附加圖片",
+      "attachImage": "附加檔案",
       "imageMode": {
         "label": "圖片生成",
         "toggle": "切換圖片生成模式",
@@ -721,7 +941,7 @@
         "commands": {
           "new": {
             "title": "新增對話",
-            "description": "停止目前任務，並開始新的對話。"
+            "description": "重置目前對話，並開始新的對話。"
           },
           "stop": {
             "title": "停止目前任務",
@@ -755,9 +975,17 @@
             "title": "恢復記憶",
             "description": "將記憶恢復到之前的 Dream 快照。"
           },
+          "dream_prompt": {
+            "title": "Dream 記憶",
+            "description": "設定 Dream 如何整理目前工作區的記憶。"
+          },
           "goal": {
             "title": "長期目標",
             "description": "請助理把這則請求當成需要多步驟持續推進的目標。"
+          },
+          "trigger": {
+            "title": "建立本機觸發器",
+            "description": "建立綁定到目前聊天工作階段的 CLI 觸發器。"
           },
           "help": {
             "title": "查看說明",
@@ -782,12 +1010,17 @@
       "encoding": "處理中…",
       "remove": "移除附件",
       "normalizedSizeHint": "{{orig}} → {{current}}（已自動壓縮）",
+      "textTooLarge": "訊息文字過大（最大 {{max}}）",
       "imageRejected": {
         "unsupported_type": "不支援的檔案類型",
+        "empty_file": "無法附加空白檔案",
+        "too_many_attachments": "每則訊息最多 {{max}} 個附件",
         "too_many_images": "每則訊息最多 {{max}} 張圖片",
         "magic_mismatch": "檔案看起來不像真正的圖片",
         "decode_failed": "無法解碼這張圖片",
-        "too_large": "圖片太大，請換一張小一點的",
+        "too_large": "檔案太大，請換一個小一點的",
+        "total_too_large": "附件總大小過大，請移除部分檔案或使用更小的檔案",
+        "transport_too_large": "此附件會超過閘道的傳輸上限",
         "io": "無法讀取這個檔案"
       },
       "mentions": {
@@ -810,6 +1043,7 @@
     },
     "scrollToBottom": "捲動到底部",
     "loadEarlier": "載入更早訊息",
+    "forkedFromHistory": "從歷史訊息分叉",
     "promptNavigator": {
       "open": "開啟輸入導覽",
       "title": "輸入列表",
@@ -835,12 +1069,24 @@
     "agentActivityLiveSummary": "進行中… · {{reasoning}} 步 · {{tools}} 次工具呼叫",
     "agentActivityLiveToolsOnly": "進行中… · {{tools}} 次工具呼叫",
     "imageAttachment": "圖片附件",
-    "copyReply": "複製回覆",
-    "copiedReply": "已複製回覆",
+    "forkFromHere": "分叉",
+    "copyReply": "複製",
+    "copiedReply": "已複製",
     "turnLatencyTitle": "本輪耗時（端到端）",
+    "fileEditViewDiff": "查看差異",
+    "fileEditViewLargeDiff": "查看大型差異",
+    "fileEditDiffLineCount": "{{count}} 行",
+    "fileEditUnchangedLinesHidden": "已隱藏 {{count}} 行未修改內容",
+    "fileEditShowMoreLines": "顯示其餘 {{count}} 行",
+    "fileEditShowFewerLines": "收起部分行",
+    "fileEditOpenFile": "開啟檔案",
+    "fileEditDiffTruncated": "差異內容已截斷。開啟檔案可查看完整更改。",
     "activityThinkingFor": "思考中，已 {{duration}}",
     "activityThought": "已思考",
     "activityThoughtFor": "已思考 {{duration}}",
+    "activityWorkingFor": "處理中，已 {{duration}}",
+    "activityWorked": "已處理",
+    "activityWorkedFor": "已處理 {{duration}}",
     "cliActivityRunningOne": "正在使用 @{{name}}",
     "cliActivityRanOne": "已使用 @{{name}}",
     "cliActivityFailedOne": "@{{name}} 失敗",

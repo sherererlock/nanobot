@@ -55,8 +55,7 @@ def load_config(config_path: Path | None = None) -> Config:
             data = _migrate_config(data)
             config = Config.model_validate(data)
         except (json.JSONDecodeError, ValueError, pydantic.ValidationError) as e:
-            logger.warning("Failed to load config from {}: {}", path, e)
-            logger.warning("Using default configuration.")
+            raise ValueError(f"Failed to load config from {path}: {e}") from e
 
     _apply_ssrf_whitelist(config)
     return config
@@ -81,9 +80,27 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     data = config.model_dump(mode="json", by_alias=True)
+    if config.providers.openai_codex.proxy is not None:
+        data.setdefault("providers", {})["openaiCodex"] = {
+            "proxy": config.providers.openai_codex.proxy,
+        }
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def merge_missing_defaults(existing: Any, defaults: Any) -> Any:
+    """Recursively add missing defaults without replacing configured values."""
+    if not isinstance(existing, dict) or not isinstance(defaults, dict):
+        return existing
+
+    merged = dict(existing)
+    for key, value in defaults.items():
+        if key not in merged:
+            merged[key] = value
+        else:
+            merged[key] = merge_missing_defaults(merged[key], value)
+    return merged
 
 
 _ENV_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -154,6 +171,23 @@ def _env_replace(match: re.Match[str]) -> str:
 
 def _migrate_config(data: dict) -> dict:
     """Migrate old config formats to current."""
+    agents = data.get("agents", {})
+    defaults = agents.get("defaults", {}) if isinstance(agents, dict) else {}
+    if isinstance(defaults, dict):
+        had_legacy_max_messages = (
+            "maxMessages" in defaults or "max_messages" in defaults
+        )
+        defaults.pop("maxMessages", None)
+        defaults.pop("max_messages", None)
+        if had_legacy_max_messages:
+            # TODO(next version): Remove this legacy cleanup branch; the schema
+            # will silently ignore this field once the warning grace period ends.
+            logger.warning(
+                "agents.defaults.maxMessages/max_messages is legacy and ignored; "
+                "replay max messages is now an internal safety cap. Remove it from "
+                "config. This compatibility warning will be removed in the next version."
+            )
+
     # Move tools.exec.restrictToWorkspace → tools.restrictToWorkspace
     tools = data.get("tools", {})
     exec_cfg = tools.get("exec", {})

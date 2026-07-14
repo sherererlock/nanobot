@@ -1,14 +1,33 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.tools.context import RequestContext, request_context
 from nanobot.bus.events import InboundMessage
+from nanobot.bus.outbound_events import (
+    GoalStatusEvent,
+    StreamDeltaEvent,
+    StreamedResponseEvent,
+    StreamEndEvent,
+    TurnEndEvent,
+)
 from nanobot.bus.queue import MessageBus
+from nanobot.cron.session_turns import CRON_HISTORY_META, CRON_TRIGGER_META
 from nanobot.providers.base import LLMResponse
+from nanobot.providers.factory import ProviderSnapshot
+from nanobot.runtime_context import (
+    RUNTIME_CONTEXT_HISTORY_META,
+    RUNTIME_CONTEXT_MESSAGE_META,
+    RuntimeContextBlock,
+    append_runtime_context,
+    public_history_message,
+)
+from nanobot.session.automation_turns import AUTOMATION_HISTORY_META
 from nanobot.session.goal_state import GOAL_STATE_KEY
 from nanobot.session.manager import Session, SessionManager
 from nanobot.session.turn_continuation import (
@@ -24,6 +43,7 @@ from nanobot.session.webui_turns import (
     clean_generated_title,
     maybe_generate_webui_title,
 )
+from nanobot.triggers.local_session_turns import LOCAL_TRIGGER_META
 from nanobot.utils.llm_runtime import LLMRuntime
 
 
@@ -35,9 +55,20 @@ def _mk_loop() -> AgentLoop:
     return loop
 
 
+def _runtime_message(content, blocks: list[RuntimeContextBlock]) -> dict:
+    merged, marker = append_runtime_context(content, blocks)
+    assert marker is not None
+    return {
+        "role": "user",
+        "content": merged,
+        "_meta": {RUNTIME_CONTEXT_MESSAGE_META: marker},
+    }
+
+
 def _make_full_loop(tmp_path: Path) -> AgentLoop:
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
+    provider.generation = SimpleNamespace(max_tokens=4096)
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Test title"))
     loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
     WebuiTurnCoordinator(
@@ -56,12 +87,120 @@ def test_agent_loop_llm_runtime_reflects_current_provider_and_model(tmp_path: Pa
     assert runtime.model == "test-model"
 
     next_provider = MagicMock()
-    loop.provider = next_provider
-    loop.model = "next-model"
+    next_provider.generation = SimpleNamespace(
+        temperature=0.1,
+        max_tokens=4096,
+        reasoning_effort=None,
+    )
+    loop.runtime_resolver.adopt_snapshot(ProviderSnapshot(
+        provider=next_provider,
+        model="next-model",
+        context_window_tokens=runtime.context_window_tokens,
+        signature=("next-model",),
+    ))
     runtime = loop.llm_runtime()
 
     assert runtime.provider is next_provider
     assert runtime.model == "next-model"
+
+
+def test_persist_cron_turn_uses_distinct_history_marker(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    session = loop.sessions.get_or_create("websocket:auto")
+    prompt_ref = {"id": "cron.agent_turn.reminder", "version": 1, "sha256": "abc"}
+
+    persisted = loop._persist_user_message_early(
+        InboundMessage(
+            channel="websocket",
+            sender_id="cron",
+            chat_id="auto",
+            content="Cron job: internal prompt",
+            metadata={
+                CRON_TRIGGER_META: {
+                    "job_id": "job-1",
+                    "job_name": "Daily check",
+                    "run_id": "job-1:1",
+                    "prompt_ref": prompt_ref,
+                    "persist_content": "Scheduled cron job triggered: Daily check",
+                }
+            },
+        ),
+        session,
+    )
+
+    assert persisted is True
+    message = session.messages[-1]
+    assert message["content"] == "Scheduled cron job triggered: Daily check"
+    assert message[AUTOMATION_HISTORY_META] == {
+        "kind": "cron",
+        "cron_job_id": "job-1",
+        "cron_job_name": "Daily check",
+        "cron_run_id": "job-1:1",
+        "cron_prompt_ref": prompt_ref,
+    }
+    assert message[CRON_HISTORY_META] is True
+    assert CRON_TRIGGER_META not in message
+    assert message["cron_job_id"] == "job-1"
+    assert message["cron_job_name"] == "Daily check"
+    assert message["cron_run_id"] == "job-1:1"
+    assert message["cron_prompt_ref"] == prompt_ref
+
+
+def test_persist_local_trigger_turn_uses_hidden_automation_marker(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    session = loop.sessions.get_or_create("websocket:auto")
+
+    persisted = loop._persist_user_message_early(
+        InboundMessage(
+            channel="websocket",
+            sender_id="trigger",
+            chat_id="auto",
+            content="Review PR #4502",
+            metadata={
+                LOCAL_TRIGGER_META: {
+                    "trigger_id": "trg_123",
+                    "trigger_name": "PR review",
+                    "delivery_id": "tdel_456",
+                    "created_at_ms": 1_700_000_000_000,
+                    "persist_content": "Local trigger received: PR review\n\nReview PR #4502",
+                }
+            },
+        ),
+        session,
+    )
+
+    assert persisted is True
+    message = session.messages[-1]
+    assert message["content"] == "Local trigger received: PR review\n\nReview PR #4502"
+    assert message[AUTOMATION_HISTORY_META] == {
+        "kind": "local_trigger",
+        "trigger_id": "trg_123",
+        "trigger_name": "PR review",
+        "trigger_delivery_id": "tdel_456",
+    }
+    assert LOCAL_TRIGGER_META not in message
+    assert message["trigger_id"] == "trg_123"
+    assert message["trigger_name"] == "PR review"
+    assert message["trigger_delivery_id"] == "tdel_456"
+
+
+@pytest.mark.asyncio
+async def test_new_with_bot_suffix_does_not_persist_command(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+
+    response = await loop._process_message(
+        InboundMessage(
+            channel="websocket",
+            sender_id="user",
+            chat_id="chat-1",
+            content="/new@nanobot_bot",
+        )
+    )
+
+    assert response is not None
+    assert response.content == "New session started."
+    session = loop.sessions.get_or_create("websocket:chat-1")
+    assert session.messages == []
 
 
 def test_clean_generated_title_strips_reasoning_tags() -> None:
@@ -145,6 +284,31 @@ async def test_generate_webui_title_ignores_command_only_sessions(tmp_path: Path
     loop.provider.chat_with_retry.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_generate_webui_title_ignores_cron_internal_turns(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    session = loop.sessions.get_or_create("websocket:cron-title")
+    session.metadata[WEBUI_SESSION_METADATA_KEY] = True
+    session.add_message(
+        "user",
+        "Scheduled cron job triggered: 30s-test\n\nInternal reminder prompt",
+        **{CRON_HISTORY_META: True},
+    )
+    session.add_message("assistant", "提醒已经到期。")
+    loop.sessions.save(session)
+
+    generated = await maybe_generate_webui_title(
+        sessions=loop.sessions,
+        session_key="websocket:cron-title",
+        provider=loop.provider,
+        model=loop.model,
+    )
+
+    assert generated is False
+    assert WEBUI_TITLE_METADATA_KEY not in session.metadata
+    loop.provider.chat_with_retry.assert_not_awaited()
+
+
 def test_webui_title_update_uses_captured_llm_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -179,7 +343,7 @@ def test_webui_title_update_uses_captured_llm_runtime(
     coordinator.capture_title_context(
         "websocket:chat1",
         msg,
-        LLMRuntime(provider, "turn-model"),
+        LLMRuntime.capture(provider, "turn-model", context_window_tokens=32_768),
     )
     asyncio.run(coordinator.handle_turn_end(
         msg,
@@ -194,89 +358,139 @@ def test_webui_title_update_uses_captured_llm_runtime(
     assert captured["model"] == "turn-model"
 
 
-def test_save_turn_skips_multimodal_user_when_only_runtime_context() -> None:
+def test_save_turn_keeps_multimodal_runtime_context_for_model_replay() -> None:
     loop = _mk_loop()
     session = Session(key="test:runtime-only")
-    runtime = ContextBuilder._RUNTIME_CONTEXT_TAG + "\nCurrent Time: now (UTC)"
+    block = RuntimeContextBlock(source="test", content="provider context")
 
     loop._save_turn(
         session,
-        [{"role": "user", "content": [{"type": "text", "text": runtime}]}],
+        [_runtime_message([], [block])],
         skip=0,
     )
-    assert session.messages == []
+    assert session.messages[0]["content"] == [
+        {"type": "text", "text": "provider context"}
+    ]
+    assert public_history_message(session.messages[0])["content"] == []
 
 
-def test_save_turn_keeps_image_placeholder_with_path_after_runtime_strip() -> None:
+def test_save_turn_keeps_image_placeholder_and_runtime_context() -> None:
     loop = _mk_loop()
     session = Session(key="test:image")
-    runtime = ContextBuilder._RUNTIME_CONTEXT_TAG + "\nCurrent Time: now (UTC)"
+    block = RuntimeContextBlock(source="test", content="provider context")
 
     loop._save_turn(
         session,
-        [{
-            "role": "user",
-            "content": [
+        [_runtime_message(
+            [
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}, "_meta": {"path": "/media/feishu/photo.jpg"}},
-                {"type": "text", "text": runtime},
             ],
-        }],
+            [block],
+        )],
         skip=0,
     )
-    assert session.messages[0]["content"] == [{"type": "text", "text": "[image: /media/feishu/photo.jpg]"}]
+    assert session.messages[0]["content"] == [
+        {"type": "text", "text": "[image: /media/feishu/photo.jpg]"},
+        {"type": "text", "text": "provider context"},
+    ]
+    assert public_history_message(session.messages[0])["content"] == [
+        {"type": "text", "text": "[image: /media/feishu/photo.jpg]"}
+    ]
 
 
 def test_save_turn_keeps_image_placeholder_without_meta() -> None:
     loop = _mk_loop()
     session = Session(key="test:image-no-meta")
-    runtime = ContextBuilder._RUNTIME_CONTEXT_TAG + "\nCurrent Time: now (UTC)"
+    block = RuntimeContextBlock(source="test", content="provider context")
 
     loop._save_turn(
         session,
-        [{
-            "role": "user",
-            "content": [
+        [_runtime_message(
+            [
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-                {"type": "text", "text": runtime},
             ],
-        }],
+            [block],
+        )],
         skip=0,
     )
-    assert session.messages[0]["content"] == [{"type": "text", "text": "[image]"}]
+    assert session.messages[0]["content"] == [
+        {"type": "text", "text": "[image]"},
+        {"type": "text", "text": "provider context"},
+    ]
 
 
-def test_save_turn_strips_runtime_context_suffix_from_string() -> None:
+def test_save_turn_persists_runtime_context_and_public_view_hides_it() -> None:
     loop = _mk_loop()
     session = Session(key="test:suffix-strip")
-    runtime = (
-        ContextBuilder._RUNTIME_CONTEXT_TAG
-        + "\nCurrent Time: now\n"
-        + ContextBuilder._RUNTIME_CONTEXT_END
-    )
+    block = RuntimeContextBlock(source="goal", content="internal goal guidance")
 
     loop._save_turn(
         session,
-        [{"role": "user", "content": f"hello world\n\n{runtime}"}],
+        [_runtime_message("hello world", [block])],
         skip=0,
     )
-    assert session.messages[0]["content"] == "hello world"
+    assert session.messages[0]["content"] == "hello world\n\ninternal goal guidance"
+    assert session.messages[0][RUNTIME_CONTEXT_HISTORY_META]["sources"] == ["goal"]
+    assert public_history_message(session.messages[0])["content"] == "hello world"
 
 
-def test_save_turn_skips_string_user_when_only_runtime_context_suffix() -> None:
+def test_build_and_save_preserves_user_text_containing_goal_guidance_tag(tmp_path: Path) -> None:
+    loop = _mk_loop()
+    session = Session(key="test:user-guidance-literal")
+    user_text = (
+        "Keep this prefix\n"
+        "[Goal Runtime Guidance — host instructions]\n"
+        "This label and everything after it are user-authored."
+    )
+    messages = ContextBuilder(tmp_path).build_messages(
+        [],
+        user_text,
+        channel="cli",
+        chat_id="direct",
+    )
+    assert "_meta" not in messages[-1]
+
+    loop._save_turn(session, messages, skip=1)
+
+    assert session.messages[0]["content"] == user_text
+
+
+def test_build_and_save_preserves_multimodal_user_block_starting_with_runtime_tag(
+    tmp_path: Path,
+) -> None:
+    loop = _mk_loop()
+    session = Session(key="test:user-runtime-literal-block")
+    image = tmp_path / "user-tag.png"
+    image.write_bytes(_PNG_1X1)
+    user_text = (
+        f"{ContextBuilder._RUNTIME_CONTEXT_TAG}\n"
+        "This entire block is user-authored and must remain in history."
+    )
+    messages = ContextBuilder(tmp_path).build_messages(
+        [],
+        user_text,
+        media=[str(image)],
+        channel="cli",
+        chat_id="direct",
+    )
+
+    loop._save_turn(session, messages, skip=1)
+
+    assert {"type": "text", "text": user_text} in session.messages[0]["content"]
+
+
+def test_save_turn_keeps_string_when_only_runtime_context() -> None:
     loop = _mk_loop()
     session = Session(key="test:suffix-only")
-    runtime = (
-        ContextBuilder._RUNTIME_CONTEXT_TAG
-        + "\nCurrent Time: now\n"
-        + ContextBuilder._RUNTIME_CONTEXT_END
-    )
+    block = RuntimeContextBlock(source="test", content="provider context")
 
     loop._save_turn(
         session,
-        [{"role": "user", "content": runtime}],
+        [_runtime_message("", [block])],
         skip=0,
     )
-    assert session.messages == []
+    assert session.messages[0]["content"] == "provider context"
+    assert public_history_message(session.messages[0])["content"] == ""
 
 
 def test_save_turn_keeps_tool_results_under_16k() -> None:
@@ -286,11 +500,22 @@ def test_save_turn_keeps_tool_results_under_16k() -> None:
 
     loop._save_turn(
         session,
-        [{"role": "tool", "tool_call_id": "call_1", "name": "read_file", "content": content}],
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "name": "read_file", "content": content},
+        ],
         skip=0,
     )
 
-    assert session.messages[0]["content"] == content
+    assert session.messages[1]["content"] == content
 
 
 def test_save_turn_stamps_latency_on_last_assistant() -> None:
@@ -623,9 +848,10 @@ async def test_internal_continuation_queues_turn_without_fake_user_history(
     assert "Finish the long goal." in queued.content
 
     session = loop.sessions.get_or_create("feishu:c-auto")
+    assert "Finish the long goal." in str(session.messages[0]["content"])
     assert [
         {k: v for k, v in m.items() if k in {"role", "content"}}
-        for m in session.messages
+        for m in map(public_history_message, session.messages)
     ] == [{"role": "user", "content": "start the goal"}]
 
     second = await loop._process_message(queued, pending_queue=asyncio.Queue())
@@ -635,7 +861,7 @@ async def test_internal_continuation_queues_turn_without_fake_user_history(
     session = loop.sessions.get_or_create("feishu:c-auto")
     assert [
         {k: v for k, v in m.items() if k in {"role", "content"}}
-        for m in session.messages
+        for m in map(public_history_message, session.messages)
     ] == [
         {"role": "user", "content": "start the goal"},
         {"role": "assistant", "content": "done"},
@@ -691,7 +917,6 @@ async def test_internal_continuation_preserves_streaming_route_metadata(
             "_wants_stream": True,
             "message_id": "om_001",
             "origin_message_id": "root_001",
-            "_stream_id": "old-stream",
         },
     ))
 
@@ -701,23 +926,23 @@ async def test_internal_continuation_preserves_streaming_route_metadata(
     assert queued.metadata["_wants_stream"] is True
     assert queued.metadata["message_id"] == "om_001"
     assert queued.metadata["origin_message_id"] == "root_001"
-    assert "_stream_id" not in queued.metadata
 
     await loop._dispatch(queued)
 
     outbound = []
     while loop.bus.outbound_size:
         outbound.append(await loop.bus.consume_outbound())
-    deltas = [m for m in outbound if m.metadata.get("_stream_delta")]
-    ends = [m for m in outbound if m.metadata.get("_stream_end")]
-    streamed_markers = [m for m in outbound if m.metadata.get("_streamed")]
+    deltas = [m for m in outbound if isinstance(m.event, StreamDeltaEvent)]
+    ends = [m for m in outbound if isinstance(m.event, StreamEndEvent)]
+    streamed_markers = [m for m in outbound if isinstance(m.event, StreamedResponseEvent)]
 
     assert [m.content for m in deltas] == ["done"]
     assert len(ends) == 1
-    assert ends[0].metadata["_resuming"] is False
+    assert isinstance(ends[0].event, StreamEndEvent)
+    assert ends[0].event.resuming is False
     assert ends[0].metadata["message_id"] == "om_001"
     assert ends[0].metadata["origin_message_id"] == "root_001"
-    assert isinstance(ends[0].metadata.get("_stream_id"), str)
+    assert isinstance(ends[0].event.stream_id, str)
     assert streamed_markers and streamed_markers[-1].content == "done"
 
 
@@ -768,10 +993,10 @@ async def test_websocket_internal_continuation_keeps_single_visible_run(
     first_outbound = []
     while loop.bus.outbound_size:
         first_outbound.append(await loop.bus.consume_outbound())
-    first_statuses = [m.metadata for m in first_outbound if m.metadata.get("_goal_status")]
-    assert [m["goal_status"] for m in first_statuses] == ["running"]
-    assert not [m for m in first_outbound if m.metadata.get("_turn_end")]
-    started_at = first_statuses[0]["started_at"]
+    first_statuses = [m.event for m in first_outbound if isinstance(m.event, GoalStatusEvent)]
+    assert [m.status for m in first_statuses] == ["running"]
+    assert not [m for m in first_outbound if isinstance(m.event, TurnEndEvent)]
+    started_at = first_statuses[0].started_at
 
     queued = await asyncio.wait_for(loop.bus.consume_inbound(), timeout=0.5)
     assert queued.metadata[INTERNAL_CONTINUATION_META] is True
@@ -782,12 +1007,13 @@ async def test_websocket_internal_continuation_keeps_single_visible_run(
     second_outbound = []
     while loop.bus.outbound_size:
         second_outbound.append(await loop.bus.consume_outbound())
-    second_statuses = [m.metadata for m in second_outbound if m.metadata.get("_goal_status")]
-    assert [m["goal_status"] for m in second_statuses] == ["running", "idle"]
-    assert second_statuses[0]["started_at"] == started_at
-    turn_end = [m for m in second_outbound if m.metadata.get("_turn_end")]
+    second_statuses = [m.event for m in second_outbound if isinstance(m.event, GoalStatusEvent)]
+    assert [m.status for m in second_statuses] == ["running", "idle"]
+    assert second_statuses[0].started_at == started_at
+    turn_end = [m for m in second_outbound if isinstance(m.event, TurnEndEvent)]
     assert len(turn_end) == 1
-    assert isinstance(turn_end[0].metadata.get("latency_ms"), int)
+    assert isinstance(turn_end[0].event, TurnEndEvent)
+    assert isinstance(turn_end[0].event.latency_ms, int)
 
 
 @pytest.mark.asyncio
@@ -881,20 +1107,90 @@ async def test_process_message_uses_explicit_session_metadata_for_goal_context(
     assert GOAL_STATE_KEY not in kwargs["session_metadata"]
 
 
-def test_set_tool_context_uses_effective_key_for_spawn_tool(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_run_agent_loop_goal_continue_message_reads_latest_metadata(
+    tmp_path: Path,
+) -> None:
+    from nanobot.agent.runner import AgentRunResult
+
+    loop = _make_full_loop(tmp_path)
+    session = loop.sessions.get_or_create("websocket:late-goal")
+    seen: dict[str, str | None] = {}
+
+    async def fake_run(spec):
+        assert callable(spec.goal_continue_message)
+        session.metadata[GOAL_STATE_KEY] = {
+            "status": "active",
+            "objective": "Goal created during this runner call.",
+        }
+        seen["goal_continue"] = spec.goal_continue_message()
+        return AgentRunResult(
+            final_content="ok",
+            messages=[{"role": "assistant", "content": "ok"}],
+        )
+
+    loop.runner.run = fake_run  # type: ignore[method-assign]
+
+    await loop._run_agent_loop(
+        [],
+        runtime=loop.llm_runtime(),
+        session=session,
+        channel="websocket",
+        chat_id="late-goal",
+        session_key=session.key,
+    )
+
+    assert "Goal created during this runner call." in (seen["goal_continue"] or "")
+
+
+@pytest.mark.asyncio
+async def test_process_direct_skip_user_persist_does_not_save_retry_user(
+    tmp_path: Path,
+) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop._connect_mcp = AsyncMock()
+    session = loop.sessions.get_or_create("api:default")
+    session.add_message("user", "hello")
+    session.add_message("assistant", "previous empty-response attempt")
+    loop.sessions.save(session)
+
+    await loop.process_direct(
+        "hello",
+        session_key=session.key,
+        channel="api",
+        chat_id="default",
+        persist_user_message=False,
+    )
+
+    session = loop.sessions.get_or_create("api:default")
+    assert [(m["role"], m["content"]) for m in session.messages] == [
+        ("user", "hello"),
+        ("assistant", "previous empty-response attempt"),
+        ("assistant", "Test title"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_request_context_uses_effective_key_for_spawn_tool(tmp_path: Path) -> None:
     loop = _make_full_loop(tmp_path)
     spawn_tool = loop.tools.get("spawn")
     assert spawn_tool is not None
+    spawn_tool._manager.spawn = AsyncMock(return_value="started")  # type: ignore[attr-defined]
+    runtime = loop.llm_runtime()
 
-    loop._set_tool_context(
-        "discord",
-        "thread-777",
+    with request_context(RequestContext(
+        channel="discord",
+        chat_id="thread-777",
         session_key="discord:parent-456:thread:thread-777",
-    )
+        runtime=runtime,
+    )):
+        await spawn_tool.execute(task="inspect context")
 
-    assert spawn_tool._origin_channel.get() == "discord"  # type: ignore[attr-defined]
-    assert spawn_tool._origin_chat_id.get() == "thread-777"  # type: ignore[attr-defined]
-    assert spawn_tool._session_key.get() == "discord:parent-456:thread:thread-777"  # type: ignore[attr-defined]
+    call = spawn_tool._manager.spawn.await_args.kwargs  # type: ignore[attr-defined]
+    assert call["origin_channel"] == "discord"
+    assert call["origin_chat_id"] == "thread-777"
+    assert call["session_key"] == "discord:parent-456:thread:thread-777"
+    assert call["runtime"] is runtime
 
 
 @pytest.mark.asyncio
@@ -1059,10 +1355,14 @@ async def test_system_subagent_followup_is_persisted_before_prompt_assembly(tmp_
     session.add_message("assistant", "working")
     loop.sessions.save(session)
 
-    seen: dict[str, list[dict]] = {}
+    runtime = loop.llm_runtime()
+    seen: dict[str, object] = {}
+    record_runtime = MagicMock(wraps=loop._runtime_events().record_turn_runtime)
+    loop.runtime_event_publisher.record_turn_runtime = record_runtime
 
-    async def fake_run_agent_loop(initial_messages, **_kwargs):
+    async def fake_run_agent_loop(initial_messages, **kwargs):
         seen["initial_messages"] = initial_messages
+        seen["runtime"] = kwargs["runtime"]
         return (
             "done",
             [],
@@ -1080,20 +1380,28 @@ async def test_system_subagent_followup_is_persisted_before_prompt_assembly(tmp_
             chat_id="cli:test",
             content="subagent result",
             metadata={"subagent_task_id": "sub-1"},
-        )
+        ),
+        runtime=runtime,
     )
 
-    non_system = [m for m in seen["initial_messages"] if m.get("role") != "system"]
+    assert seen["runtime"] is runtime
+    record_runtime.assert_called_once_with("cli:test", runtime)
+    assert len(loop.consolidator.maybe_consolidate_by_tokens.call_args_list) == 2
+    assert all(
+        call.kwargs["runtime"] is runtime
+        for call in loop.consolidator.maybe_consolidate_by_tokens.call_args_list
+    )
+    initial_messages = seen["initial_messages"]
+    assert isinstance(initial_messages, list)
+    non_system = [m for m in initial_messages if m.get("role") != "system"]
     assert "question" in non_system[0]["content"]
     assert "working" in non_system[1]["content"]
-    # User turns carry the timestamp prefix so the model can reason about
-    # relative time. Assistant turns do NOT, otherwise the model treats those
-    # past replies as in-context examples and starts its own outputs with
-    # ``[Message Time: ...]`` (which then leaks back to the user).
-    assert "[Message Time:" in non_system[0]["content"]
+    # Persisted timestamps stay in session records, but replay content is not
+    # rewritten with volatile ``[Message Time: ...]`` prefixes.
+    assert "[Message Time:" not in non_system[0]["content"]
     assert "[Message Time:" not in non_system[1]["content"]
     assert non_system[2]["content"].count("subagent result") == 1
-    assert "Current Time:" in non_system[2]["content"]
+    assert non_system[2]["content"] == "subagent result"
 
     loop.sessions.invalidate("cli:test")
     persisted = loop.sessions.get_or_create("cli:test")
@@ -1215,21 +1523,28 @@ def test_subagent_followup_skips_empty_content() -> None:
     assert session.messages == []
 
 
-def test_set_tool_context_passes_thread_session_key_to_spawn(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_request_context_passes_thread_session_key_to_spawn(tmp_path: Path) -> None:
     loop = _make_full_loop(tmp_path)
+    spawn_tool = loop.tools.get("spawn")
+    assert spawn_tool is not None
+    spawn_tool._manager.spawn = AsyncMock(return_value="started")  # type: ignore[attr-defined]
+    runtime = loop.llm_runtime()
 
-    loop._set_tool_context(
-        "slack",
-        "C123",
+    with request_context(RequestContext(
+        channel="slack",
+        chat_id="C123",
         message_id="msg-123",
         metadata={"slack": {"thread_ts": "1700.42", "channel_type": "channel"}},
         session_key="slack:C123:1700.42",
-    )
+        runtime=runtime,
+    )):
+        await spawn_tool.execute(task="inspect thread")
 
-    spawn_tool = loop.tools.get("spawn")
-    assert spawn_tool is not None
-    assert spawn_tool._session_key.get() == "slack:C123:1700.42"
-    assert spawn_tool._origin_message_id.get() == "msg-123"
+    call = spawn_tool._manager.spawn.await_args.kwargs  # type: ignore[attr-defined]
+    assert call["session_key"] == "slack:C123:1700.42"
+    assert call["origin_message_id"] == "msg-123"
+    assert call["runtime"] is runtime
 
 
 @pytest.mark.asyncio
@@ -1278,3 +1593,146 @@ async def test_system_subagent_followup_uses_thread_session_and_slack_metadata(t
     loop.sessions.invalidate("slack:C123:1700.42")
     persisted = loop.sessions.get_or_create("slack:C123:1700.42")
     assert any(m.get("subagent_task_id") == "sub-1" for m in persisted.messages)
+
+
+@pytest.mark.asyncio
+async def test_turn_after_unanswered_user_keeps_tool_call_pairing(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    session = loop.sessions.get_or_create("feishu:c-merge")
+    session.add_message("user", "earlier question that never got an answer")
+    loop.sessions.save(session)
+
+    async def fake_run_agent_loop(initial_messages, **_kwargs):
+        assert [m["role"] for m in initial_messages] == ["system", "user"]
+        return (
+            "done",
+            [],
+            [
+                *initial_messages,
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_ls",
+                        "type": "function",
+                        "function": {"name": "exec", "arguments": '{"command": "ls"}'},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": "call_ls", "name": "exec", "content": "file.txt"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "stop",
+            False,
+        )
+
+    loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
+
+    result = await loop._process_message(
+        InboundMessage(
+            channel="feishu", sender_id="u1", chat_id="c-merge", content="and another thing"
+        )
+    )
+
+    assert result is not None
+    loop.sessions.invalidate("feishu:c-merge")
+    persisted = loop.sessions.get_or_create("feishu:c-merge")
+
+    declared: set[str] = set()
+    for message in persisted.messages:
+        if message.get("role") == "assistant":
+            declared.update(
+                str(tc["id"]) for tc in message.get("tool_calls") or [] if tc.get("id")
+            )
+        if message.get("role") == "tool":
+            assert str(message.get("tool_call_id")) in declared, (
+                f"orphaned tool result {message.get('tool_call_id')!r}: "
+                f"{[m.get('role') for m in persisted.messages]}"
+            )
+    assert [m["role"] for m in persisted.messages] == [
+        "user", "user", "assistant", "tool", "assistant",
+    ]
+
+
+def test_save_turn_keeps_placeholder_for_empty_tool_result_blocks() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:empty-tool-blocks")
+
+    loop._save_turn(
+        session,
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_empty",
+                    "type": "function",
+                    "function": {"name": "exec", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_empty", "name": "exec", "content": []},
+        ],
+        skip=0,
+    )
+
+    assert [m["role"] for m in session.messages] == ["assistant", "tool"]
+    assert session.messages[1]["content"] == [
+        {"type": "text", "text": "[tool result omitted during persistence]"}
+    ]
+
+
+def test_save_turn_drops_orphaned_tool_results() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:orphan-guard")
+    session.add_message("user", "hi")
+
+    loop._save_turn(
+        session,
+        [
+            {"role": "tool", "tool_call_id": "call_ghost", "name": "exec", "content": "boo"},
+            {"role": "assistant", "content": "done"},
+        ],
+        skip=0,
+    )
+
+    assert [m["role"] for m in session.messages] == ["user", "assistant"]
+
+
+def test_save_turn_drops_tool_results_without_tool_call_id() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:missing-tool-call-id")
+    session.add_message("user", "hi")
+
+    loop._save_turn(
+        session,
+        [
+            {"role": "tool", "name": "exec", "content": "missing id"},
+            {"role": "assistant", "content": "done"},
+        ],
+        skip=0,
+    )
+
+    assert [m["role"] for m in session.messages] == ["user", "assistant"]
+
+
+def test_save_turn_keeps_tool_results_declared_in_prior_history() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:prior-declared")
+    session.add_message(
+        "assistant",
+        "working",
+        tool_calls=[{
+            "id": "call_prior",
+            "type": "function",
+            "function": {"name": "exec", "arguments": "{}"},
+        }],
+    )
+
+    loop._save_turn(
+        session,
+        [{"role": "tool", "tool_call_id": "call_prior", "name": "exec", "content": "ok"}],
+        skip=0,
+    )
+
+    assert [m["role"] for m in session.messages] == ["assistant", "tool"]

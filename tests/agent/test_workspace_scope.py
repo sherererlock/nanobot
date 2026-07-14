@@ -2,15 +2,19 @@ import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from nanobot.agent.tools.cli_apps import CliAppsTool
-from nanobot.agent.tools.filesystem import ReadFileTool
+from nanobot.agent.tools.context import RequestContext, request_context
+from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool
 from nanobot.agent.tools.image_generation import ImageGenerationError, ImageGenerationTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.apps.cli.service import CliAppManager, CliAppsRuntimeConfig
+from nanobot.config.schema import ImageGenerationToolConfig, ProviderConfig
 from nanobot.security.workspace_access import (
     WORKSPACE_SCOPE_METADATA_KEY,
     WorkspaceScopeError,
@@ -20,8 +24,6 @@ from nanobot.security.workspace_access import (
     validate_workspace_scope_payload,
     workspace_scope_from_metadata,
 )
-from nanobot.apps.cli.service import CliAppManager, CliAppsRuntimeConfig
-from nanobot.config.schema import ImageGenerationToolConfig, ProviderConfig
 
 PNG_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
@@ -117,6 +119,28 @@ async def test_filesystem_tool_uses_current_restricted_workspace_scope(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_filesystem_write_tool_full_scope_allows_outside_project(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    tool = WriteFileTool(workspace=tmp_path, allowed_dir=tmp_path, restrict_to_workspace=True)
+    scope = validate_workspace_scope_payload(
+        {"project_path": str(project), "access_mode": "full"},
+        default_workspace=tmp_path,
+        default_restrict_to_workspace=True,
+    )
+    token = bind_workspace_scope(scope)
+    try:
+        result = await tool.execute(path=str(outside / "outside.txt"), content="ok")
+    finally:
+        reset_workspace_scope(token)
+
+    assert "Successfully wrote" in result
+    assert (outside / "outside.txt").read_text(encoding="utf-8") == "ok"
+
+
+@pytest.mark.asyncio
 async def test_exec_tool_uses_scope_project_as_default_cwd(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -128,7 +152,12 @@ async def test_exec_tool_uses_scope_project_as_default_cwd(tmp_path: Path) -> No
     )
     token = bind_workspace_scope(scope)
     try:
-        result = await tool.execute(command="printf ok > scoped-marker.txt")
+        result = await tool.execute(
+            command=(
+                'python -c "from pathlib import Path; '
+                "Path('scoped-marker.txt').write_text('ok')\""
+            )
+        )
     finally:
         reset_workspace_scope(token)
 
@@ -150,7 +179,13 @@ async def test_exec_full_scope_allows_explicit_cwd_outside_project(tmp_path: Pat
     )
     token = bind_workspace_scope(scope)
     try:
-        result = await tool.execute(command="printf ok > outside-marker.txt", working_dir=str(outside))
+        result = await tool.execute(
+            command=(
+                'python -c "from pathlib import Path; '
+                "Path('outside-marker.txt').write_text('ok')\""
+            ),
+            working_dir=str(outside),
+        )
     finally:
         reset_workspace_scope(token)
 
@@ -340,7 +375,12 @@ async def test_spawn_tool_forwards_current_workspace_scope(tmp_path: Path) -> No
     tool = SpawnTool(manager)  # type: ignore[arg-type]
     token = bind_workspace_scope(scope)
     try:
-        result = await tool.execute(task="inspect")
+        with request_context(RequestContext(
+            channel="test",
+            chat_id="chat",
+            runtime=MagicMock(),
+        )):
+            result = await tool.execute(task="inspect")
     finally:
         reset_workspace_scope(token)
 

@@ -19,9 +19,18 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request as WsRequest
 
 from nanobot.bus.events import OUTBOUND_META_AGENT_UI, OutboundMessage
+from nanobot.bus.outbound_events import (
+    GoalStateSyncEvent,
+    GoalStatusEvent,
+    ProgressEvent,
+    RuntimeModelUpdatedEvent,
+    SessionUpdatedEvent,
+    TurnEndEvent,
+    outbound_event_from_message,
+    outbound_message_for_event,
+)
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 from nanobot.security.workspace_access import (
     WORKSPACE_SCOPE_METADATA_KEY,
@@ -29,11 +38,8 @@ from nanobot.security.workspace_access import (
 )
 from nanobot.session.goal_state import goal_state_ws_blob
 from nanobot.session.webui_turns import websocket_turn_wall_started_at
-from nanobot.utils.media_decode import (
-    FileSizeExceeded,
-    save_base64_data_url,
-)
 from nanobot.webui.cli_apps_api import normalize_cli_app_mentions
+from nanobot.webui.forking import handle_webui_fork_chat
 from nanobot.webui.gateway_services import GatewayServices
 from nanobot.webui.http_utils import (
     normalize_config_path as _normalize_config_path,
@@ -47,6 +53,9 @@ from nanobot.webui.http_utils import (
 from nanobot.webui.mcp_presets_api import normalize_mcp_preset_mentions
 from nanobot.webui.transcription_ws import webui_transcription_event
 from nanobot.webui.websocket_logging import websockets_server_logger
+
+# Plain HTTP WebUI routes also run through websockets.process_request.
+_WEBUI_HTTP_OPEN_TIMEOUT_S = 360.0
 
 
 class WebSocketConfig(Base):
@@ -69,7 +78,7 @@ class WebSocketConfig(Base):
       shared filesystem or an HTTP file server to access these files.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     host: str = "127.0.0.1"
     port: int = 8765
     unix_socket_path: str = ""
@@ -147,16 +156,13 @@ def publish_runtime_model_update(
     model_preset: str | None,
 ) -> None:
     """Enqueue a runtime model snapshot for websocket subscribers (fan-out in-channel)."""
-    bus.outbound.put_nowait(OutboundMessage(
-        channel="websocket",
-        chat_id="*",
-        content="",
-        metadata={
-            "_runtime_model_updated": True,
-            "model": model,
-            "model_preset": model_preset,
-        },
-    ))
+    bus.outbound.put_nowait(
+        outbound_message_for_event(
+            channel="websocket",
+            chat_id="*",
+            event=RuntimeModelUpdatedEvent(model=model, model_preset=model_preset),
+        )
+    )
 
 
 def _parse_inbound_payload(raw: str) -> str | None:
@@ -210,45 +216,6 @@ def _parse_envelope(raw: str) -> dict[str, Any] | None:
     return data
 
 
-# Per-message media limits. The server-side guard is a touch looser than the
-# client's ``Worker`` normalization target (6 MB) — tolerate client slop, but
-# still cap total ingress at ``_MAX_IMAGES_PER_MESSAGE * _MAX_IMAGE_BYTES``
-# which fits comfortably inside ``max_message_bytes``.
-_MAX_IMAGES_PER_MESSAGE = 4
-_MAX_IMAGE_BYTES = 8 * 1024 * 1024
-_MAX_VIDEOS_PER_MESSAGE = 1
-_MAX_VIDEO_BYTES = 20 * 1024 * 1024
-
-# Image MIME whitelist — matches the Composer's ``accept`` list. SVG is
-# explicitly excluded to avoid the XSS surface inside embedded scripts.
-_IMAGE_MIME_ALLOWED: frozenset[str] = frozenset({
-    "image/png",
-    "image/jpeg",
-    "image/webp",
-    "image/gif",
-})
-
-_VIDEO_MIME_ALLOWED: frozenset[str] = frozenset({
-    "video/mp4",
-    "video/webm",
-    "video/quicktime",
-})
-
-_UPLOAD_MIME_ALLOWED: frozenset[str] = _IMAGE_MIME_ALLOWED | _VIDEO_MIME_ALLOWED
-
-_DATA_URL_MIME_RE = re.compile(r"^data:([^;,]+)(?:;[^,]*)*;base64,", re.DOTALL)
-
-
-def _extract_data_url_mime(url: str) -> str | None:
-    """Return the MIME type of a ``data:<mime>;base64,...`` URL, else ``None``."""
-    if not isinstance(url, str):
-        return None
-    m = _DATA_URL_MIME_RE.match(url)
-    if not m:
-        return None
-    return m.group(1).strip().lower() or None
-
-
 def _is_websocket_upgrade(request: WsRequest) -> bool:
     """Detect an actual WS upgrade; plain HTTP GETs to the same path should fall through."""
     upgrade = request.headers.get("Upgrade") or request.headers.get("upgrade")
@@ -290,6 +257,7 @@ class WebSocketChannel(BaseChannel):
         self._http_router = gateway.http
         self._tokens = gateway.tokens
         self._media = gateway.media
+        self._ingress = gateway.ingress
         self._transcripts = gateway.transcripts
         self._workspaces = gateway.workspaces
 
@@ -474,6 +442,7 @@ class WebSocketChannel(BaseChannel):
                     handler,
                     socket_path,
                     process_request=process_request,
+                    open_timeout=_WEBUI_HTTP_OPEN_TIMEOUT_S,
                     max_size=self.config.max_message_bytes,
                     ping_interval=self.config.ping_interval_s,
                     ping_timeout=self.config.ping_timeout_s,
@@ -487,6 +456,7 @@ class WebSocketChannel(BaseChannel):
                     self.config.host,
                     self.config.port,
                     process_request=process_request,
+                    open_timeout=_WEBUI_HTTP_OPEN_TIMEOUT_S,
                     max_size=self.config.max_message_bytes,
                     ping_interval=self.config.ping_interval_s,
                     ping_timeout=self.config.ping_timeout_s,
@@ -569,74 +539,6 @@ class WebSocketChannel(BaseChannel):
 
     # -- Inbound WebSocket envelopes ---------------------------------------
 
-    def _save_envelope_media(
-        self,
-        media: list[Any],
-    ) -> tuple[list[str], str | None]:
-        """Decode and persist ``media`` items from a ``message`` envelope.
-
-        Returns ``(paths, None)`` on success or ``([], reason)`` on the first
-        failure — the caller is expected to surface ``reason`` to the client
-        and skip publishing so no half-formed message ever reaches the agent.
-        On failure, any files already written to disk earlier in the same
-        call are unlinked so partial ingress doesn't leak orphan files.
-        ``reason`` is a short, stable token suitable for UI localization.
-
-        Shape: ``list[{"data_url": str, "name"?: str | None}]``.
-        """
-        image_count = 0
-        video_count = 0
-        for item in media:
-            mime = _extract_data_url_mime(item.get("data_url", "")) if isinstance(item, dict) else None
-            if mime in _VIDEO_MIME_ALLOWED:
-                video_count += 1
-            elif mime in _IMAGE_MIME_ALLOWED:
-                image_count += 1
-        if image_count > _MAX_IMAGES_PER_MESSAGE:
-            return [], "too_many_images"
-        if video_count > _MAX_VIDEOS_PER_MESSAGE:
-            return [], "too_many_videos"
-
-        media_dir = get_media_dir("websocket")
-        paths: list[str] = []
-
-        def _abort(reason: str) -> tuple[list[str], str]:
-            for p in paths:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except OSError as exc:
-                    self.logger.warning(
-                        "failed to unlink partial media {}: {}", p, exc
-                    )
-            return [], reason
-
-        for item in media:
-            if not isinstance(item, dict):
-                return _abort("malformed")
-            data_url = item.get("data_url")
-            if not isinstance(data_url, str) or not data_url:
-                return _abort("malformed")
-            mime = _extract_data_url_mime(data_url)
-            if mime is None:
-                return _abort("decode")
-            if mime not in _UPLOAD_MIME_ALLOWED:
-                return _abort("mime")
-            is_video = mime in _VIDEO_MIME_ALLOWED
-            max_bytes = _MAX_VIDEO_BYTES if is_video else _MAX_IMAGE_BYTES
-            try:
-                saved = save_base64_data_url(
-                    data_url, media_dir, max_bytes=max_bytes,
-                )
-            except FileSizeExceeded:
-                return _abort("size")
-            except Exception as exc:
-                self.logger.warning("media decode failed: {}", exc)
-                return _abort("decode")
-            if saved is None:
-                return _abort("decode")
-            paths.append(saved)
-        return paths, None
-
     async def _dispatch_envelope(
         self,
         connection: Any,
@@ -667,6 +569,9 @@ class WebSocketChannel(BaseChannel):
                 workspace_scope=scope.payload(),
             )
             await self._hydrate_after_subscribe(new_id)
+            return
+        if t == "fork_chat":
+            await handle_webui_fork_chat(self, connection, envelope)
             return
         if t == "attach":
             cid = envelope.get("chat_id")
@@ -716,28 +621,47 @@ class WebSocketChannel(BaseChannel):
             if not isinstance(content, str):
                 await self._send_event(connection, "error", detail="missing content")
                 return
+            message_rejection = self._ingress.validate_text(content)
+            if message_rejection is not None:
+                await self._send_event(
+                    connection,
+                    "error",
+                    chat_id=cid,
+                    detail="message_rejected",
+                    reason=message_rejection,
+                )
+                return
 
             raw_media = envelope.get("media")
             media_paths: list[str] = []
             if raw_media is not None:
                 if not isinstance(raw_media, list):
                     await self._send_event(
-                        connection, "error",
-                        detail="image_rejected", reason="malformed",
+                        connection,
+                        "error",
+                        detail="attachment_rejected",
+                        reason="malformed",
                     )
                     return
-                media_paths, reason = self._save_envelope_media(raw_media)
+                media_paths, reason = self._media.store_inbound_attachments(raw_media)
                 if reason is not None:
                     await self._send_event(
-                        connection, "error",
-                        detail="image_rejected", reason=reason,
+                        connection,
+                        "error",
+                        detail="attachment_rejected",
+                        reason=reason,
                     )
                     return
 
-            # Allow image-only turns (content may be empty when media is attached).
+            # Allow media-only turns (content may be empty when attachments are present).
             if not content.strip() and not media_paths:
                 await self._send_event(connection, "error", detail="missing content")
                 return
+            # Auto-attach on first use so clients can one-shot without a separate attach.
+            self._attach(connection, cid)
+            await self._hydrate_after_subscribe(cid)
+
+            # Resolve after hydration so a concurrent downgrade cannot be overwritten.
             scope = await self._workspace_scope_or_error(
                 connection,
                 lambda: self._workspaces.scope_for_message(
@@ -751,9 +675,6 @@ class WebSocketChannel(BaseChannel):
             if scope is None:
                 return
 
-            # Auto-attach on first use so clients can one-shot without a separate attach.
-            self._attach(connection, cid)
-            await self._hydrate_after_subscribe(cid)
             metadata: dict[str, Any] = {"remote": getattr(connection, "remote_address", None)}
             if envelope.get("webui") is True:
                 metadata["webui"] = True
@@ -766,13 +687,6 @@ class WebSocketChannel(BaseChannel):
                 metadata["mcp_presets"] = mcp_presets
             metadata[WORKSPACE_SCOPE_METADATA_KEY] = scope.metadata()
             self._workspaces.persist_scope(cid, scope)
-            image_generation = envelope.get("image_generation")
-            if isinstance(image_generation, dict) and image_generation.get("enabled") is True:
-                aspect_ratio = image_generation.get("aspect_ratio")
-                metadata["image_generation"] = {
-                    "enabled": True,
-                    "aspect_ratio": aspect_ratio if isinstance(aspect_ratio, str) else None,
-                }
             if metadata.get("webui") is True and self.is_allowed(client_id):
                 self._transcripts.append_user_message(
                     cid,
@@ -823,6 +737,10 @@ class WebSocketChannel(BaseChannel):
         if self._server_task:
             try:
                 await self._server_task
+            except asyncio.CancelledError:
+                if asyncio.current_task() and asyncio.current_task().cancelling():
+                    raise
+                self.logger.debug("server task was already cancelled during shutdown")
             except Exception as e:
                 self.logger.warning("server task error during shutdown: {}", e)
             self._server_task = None
@@ -843,69 +761,63 @@ class WebSocketChannel(BaseChannel):
             raise
 
     async def send(self, msg: OutboundMessage) -> None:
-        if msg.metadata.get("_runtime_model_updated"):
+        event = outbound_event_from_message(msg)
+        progress_event = event if isinstance(event, ProgressEvent) else None
+        if isinstance(event, RuntimeModelUpdatedEvent):
             await self.send_runtime_model_updated(
-                model_name=msg.metadata.get("model"),
-                model_preset=msg.metadata.get("model_preset"),
+                model_name=event.model,
+                model_preset=event.model_preset,
             )
             return
 
         # Snapshot the subscriber set so ConnectionClosed cleanups mid-iteration are safe.
         conns = list(self._subs.get(msg.chat_id, ()))
         if not conns:
-            if (
-                msg.metadata.get("_progress")
-                or msg.metadata.get("_file_edit_events")
-                or msg.metadata.get("_turn_end")
-                or msg.metadata.get("_session_updated")
-                or msg.metadata.get("_goal_status")
-                or msg.metadata.get("_goal_state_sync")
+            if isinstance(
+                event,
+                ProgressEvent
+                | TurnEndEvent
+                | SessionUpdatedEvent
+                | GoalStatusEvent
+                | GoalStateSyncEvent,
             ):
                 self.logger.debug("no active subscribers for chat_id={}", msg.chat_id)
             else:
                 self.logger.warning("no active subscribers for chat_id={}", msg.chat_id)
-        if msg.metadata.get("_goal_state_sync"):
+        if isinstance(event, GoalStateSyncEvent):
             if conns:
-                blob = msg.metadata.get("goal_state")
-                await self.send_goal_state(msg.chat_id, blob if isinstance(blob, dict) else {"active": False})
+                await self.send_goal_state(msg.chat_id, event.goal_state or {"active": False})
             return
-        if msg.metadata.get("_goal_status"):
+        if isinstance(event, GoalStatusEvent):
             if conns:
-                status = msg.metadata.get("goal_status")
-                if status in ("running", "idle"):
-                    started_raw = msg.metadata.get("started_at", msg.metadata.get("goal_started_at"))
+                if event.status in ("running", "idle"):
                     await self.send_goal_status(
                         msg.chat_id,
-                        status,
-                        started_at=float(started_raw) if isinstance(started_raw, int | float) else None,
+                        event.status,
+                        started_at=event.started_at,
                     )
             return
         # Signal that the agent has fully finished processing the current turn.
-        if msg.metadata.get("_turn_end"):
-            lat = msg.metadata.get("latency_ms")
-            lat_i = int(lat) if isinstance(lat, (int, float)) else None
-            gs = msg.metadata.get("goal_state")
-            gs_blob = gs if isinstance(gs, dict) else None
+        if isinstance(event, TurnEndEvent):
             await self.send_turn_end(
                 msg.chat_id,
-                latency_ms=lat_i,
-                goal_state=gs_blob,
+                latency_ms=event.latency_ms,
+                goal_state=event.goal_state,
                 metadata=msg.metadata,
             )
+            await self.send_session_updated(msg.chat_id, scope="thread")
             return
-        if msg.metadata.get("_session_updated"):
+        if isinstance(event, SessionUpdatedEvent):
             if conns:
-                scope = msg.metadata.get("_session_update_scope")
                 await self.send_session_updated(
                     msg.chat_id,
-                    scope=scope if isinstance(scope, str) else None,
+                    scope=event.scope,
                 )
             return
-        if msg.metadata.get("_file_edit_events"):
-            edits = msg.metadata.get("_file_edit_events")
+        if progress_event and progress_event.file_edit_events:
             await self.send_file_edit_events(
                 msg.chat_id,
-                edits if isinstance(edits, list) else [],
+                progress_event.file_edit_events,
                 msg.metadata,
             )
             return
@@ -930,17 +842,17 @@ class WebSocketChannel(BaseChannel):
         lat = msg.metadata.get("latency_ms")
         if isinstance(lat, (int, float)):
             payload["latency_ms"] = int(lat)
-        if msg.metadata.get("_tool_events"):
-            payload["tool_events"] = msg.metadata["_tool_events"]
+        if progress_event and progress_event.tool_events:
+            payload["tool_events"] = progress_event.tool_events
         agent_ui = msg.metadata.get(OUTBOUND_META_AGENT_UI)
         if agent_ui is not None:
             payload["agent_ui"] = agent_ui
         # Mark intermediate agent breadcrumbs (tool-call hints, generic
         # progress strings) so WS clients can render them as subordinate
         # trace rows rather than conversational replies.
-        if msg.metadata.get("_tool_hint"):
+        if progress_event and progress_event.tool_hint:
             payload["kind"] = "tool_hint"
-        elif msg.metadata.get("_progress"):
+        elif progress_event:
             payload["kind"] = "progress"
         phase = "activity" if payload.get("kind") in ("tool_hint", "progress") else "answer"
         self._transcripts.prepare_and_append(
@@ -962,6 +874,8 @@ class WebSocketChannel(BaseChannel):
         chat_id: str,
         delta: str,
         metadata: dict[str, Any] | None = None,
+        *,
+        stream_id: str | None = None,
     ) -> None:
         """Push one chunk of model reasoning. Mirrors ``send_delta`` shape so
         clients receive a stream that opens, updates in place, and closes —
@@ -977,7 +891,6 @@ class WebSocketChannel(BaseChannel):
             "chat_id": chat_id,
             "text": delta,
         }
-        stream_id = meta.get("_stream_id")
         if stream_id is not None:
             body["stream_id"] = stream_id
         self._transcripts.prepare_and_append(
@@ -996,6 +909,8 @@ class WebSocketChannel(BaseChannel):
         self,
         chat_id: str,
         metadata: dict[str, Any] | None = None,
+        *,
+        stream_id: str | None = None,
     ) -> None:
         """Close the current reasoning stream segment for in-place renderers."""
         conns = list(self._subs.get(chat_id, ()))
@@ -1004,7 +919,6 @@ class WebSocketChannel(BaseChannel):
             "event": "reasoning_end",
             "chat_id": chat_id,
         }
-        stream_id = meta.get("_stream_id")
         if stream_id is not None:
             body["stream_id"] = stream_id
         self._transcripts.prepare_and_append(
@@ -1048,18 +962,22 @@ class WebSocketChannel(BaseChannel):
         chat_id: str,
         delta: str,
         metadata: dict[str, Any] | None = None,
+        *,
+        stream_id: str | None = None,
+        stream_end: bool = False,
+        resuming: bool = False,
     ) -> None:
         conns = list(self._subs.get(chat_id, ()))
         meta = metadata or {}
-        stream_key = (chat_id, str(meta.get("_stream_id") or ""))
-        if meta.get("_stream_end"):
+        stream_key = (chat_id, str(stream_id or ""))
+        if stream_end:
             body: dict[str, Any] = {"event": "stream_end", "chat_id": chat_id}
             buffered = self._stream_text_buffers.pop(stream_key, [])
             if delta:
                 buffered.append(delta)
             full_text = "".join(buffered)
             rewritten = self._media.rewrite_local_markdown_images(full_text)
-            if rewritten != full_text:
+            if delta or rewritten != full_text:
                 body["text"] = rewritten
         else:
             body = {
@@ -1068,8 +986,8 @@ class WebSocketChannel(BaseChannel):
                 "text": delta,
             }
             self._stream_text_buffers.setdefault(stream_key, []).append(delta)
-        if meta.get("_stream_id") is not None:
-            body["stream_id"] = meta["_stream_id"]
+        if stream_id is not None:
+            body["stream_id"] = stream_id
         self._transcripts.prepare_and_append(
             chat_id,
             body,
@@ -1142,8 +1060,8 @@ class WebSocketChannel(BaseChannel):
             await self._safe_send_to(connection, raw, label=" goal_status ")
 
     async def send_session_updated(self, chat_id: str, *, scope: str | None = None) -> None:
-        """Notify clients that session metadata changed outside the main turn."""
-        conns = list(self._subs.get(chat_id, ()))
+        """Notify WebUI clients that a session row should refresh."""
+        conns = list(self._conn_chats)
         if not conns:
             return
         body: dict[str, Any] = {"event": "session_updated", "chat_id": chat_id}

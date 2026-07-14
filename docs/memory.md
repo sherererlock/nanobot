@@ -1,4 +1,8 @@
-# Memory System in nanobot
+# AI Agent Memory in nanobot
+
+This page explains how nanobot implements long-term AI agent memory: session
+history, compressed archives, durable knowledge files, Dream consolidation, and
+Git-backed memory changes.
 
 This document explains how nanobot's memory system is implemented in the current repository.
 
@@ -294,8 +298,11 @@ The key memory files are:
 
 ```text
 workspace/
-├── SOUL.md
-├── USER.md
+├── SOUL.md              # The bot's long-term voice and communication style
+├── USER.md              # Stable knowledge about the user
+├── prompts/
+│   ├── README.md        # Notes for memory guidance files
+│   └── dream.md         # Optional instructions for how Dream organizes memory
 └── memory/
     ├── MEMORY.md
     ├── history.jsonl
@@ -340,6 +347,59 @@ Source entry points:
 - [`cmd_dream()`](../nanobot/command/builtin.py#L306-L367)
 - [`cmd_dream_log()`](../nanobot/command/builtin.py#L442-L489), [`cmd_dream_restore()`](../nanobot/command/builtin.py#L492-L535)
 - [`build_dream_commit_message()`](../nanobot/agent/memory.py#L514-L519), [`prune_dream_sessions()`](../nanobot/agent/memory.py#L522-L540)
+
+- `history.jsonl` is for structure
+- `SOUL.md`, `USER.md`, and `MEMORY.md` are for meaning
+
+## Commands
+
+Memory is not hidden behind the curtain. Users can inspect and guide it.
+
+| Command | What it does |
+|---------|--------------|
+| `/dream` | Run Dream immediately |
+| `/dream-log` | Show the latest Dream memory change |
+| `/dream-log <sha>` | Show a specific Dream change |
+| `/dream-restore` | List recent Dream memory versions |
+| `/dream-restore <sha>` | Restore memory to the state before a specific change |
+| `/dream-prompt` | Show how Dream is being guided for memory |
+| `/dream-prompt init` | Create an editable Dream memory guide at `prompts/dream.md` |
+
+These commands exist for a reason: automatic memory is powerful, but users should always retain the right to inspect, understand, and restore it.
+
+## Versioned Memory
+
+After Dream changes long-term memory files, nanobot can record that change with `GitStore`.
+
+This gives memory a history of its own:
+
+- you can inspect what changed
+- you can compare versions
+- you can restore a previous state
+
+That turns memory from a silent mutation into an auditable process.
+
+## Guiding Dream
+
+Dream decides what to keep, update, or forget using nanobot's built-in memory instructions. Most users can leave this alone.
+
+If one workspace needs a different memory style, create an editable guide:
+
+```text
+/dream-prompt init
+```
+
+This creates:
+
+```text
+workspace/prompts/dream.md
+```
+
+Edit that file in plain Markdown. When it has content, Dream follows it for this workspace before reading the latest conversation history. You do not need to paste history into the file; Dream adds the current `## Conversation History` block automatically.
+
+To return to nanobot's default behavior, delete `prompts/dream.md` or leave it empty.
+
+Each workspace has its own guide. Changing this file does not affect other nanobot workspaces.
 
 ## Configuration
 

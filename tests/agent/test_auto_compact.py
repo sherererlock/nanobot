@@ -45,6 +45,33 @@ def _add_turns(session, turns: int, *, prefix: str = "msg") -> None:
         session.add_message("assistant", f"{prefix} assistant {i}")
 
 
+def _add_tool_turn(session, prefix: str, idx: int) -> None:
+    call_id = f"{prefix}_{idx}"
+    session.messages.append(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "exec", "arguments": "{}"},
+                }
+            ],
+            "timestamp": datetime.now().isoformat(),
+        }
+    )
+    session.messages.append(
+        {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": "exec",
+            "content": "ok",
+            "timestamp": datetime.now().isoformat(),
+        }
+    )
+
+
 def _make_fake_compact(
     loop: AgentLoop,
     *,
@@ -58,13 +85,12 @@ def _make_fake_compact(
 
     state = {"count": 0}
 
-    async def _fake_compact(key: str, max_suffix: int = 8) -> str:
+    async def _fake_compact(key: str, *, runtime, max_suffix: int = 8) -> str:
         state["count"] += 1
         session = loop.sessions.get_or_create(key)
 
         tail = list(session.messages[session.last_consolidated:])
         if not tail:
-            session.updated_at = datetime.now()
             loop.sessions.save(session)
             return ""
 
@@ -76,12 +102,14 @@ def _make_fake_compact(
             metadata={},
             last_consolidated=0,
         )
-        dropped, already_consolidated = probe.retain_recent_legal_suffix(max_suffix)
+        result = probe.retain_recent_legal_suffix(
+            max_suffix,
+            extend_to_user=True,
+        )
         kept = probe.messages
-        archive_msgs = dropped[already_consolidated:]
+        archive_msgs = result.dropped[result.already_consolidated_count:]
 
         if not archive_msgs and not kept:
-            session.updated_at = datetime.now()
             loop.sessions.save(session)
             return ""
 
@@ -102,7 +130,6 @@ def _make_fake_compact(
 
         session.messages = kept
         session.last_consolidated = 0
-        session.updated_at = datetime.now()
         loop.sessions.save(session)
         return s
 
@@ -121,9 +148,14 @@ async def _drain_background_tasks(loop: AgentLoop) -> None:
 class TestSessionTTLConfig:
     """Test session TTL configuration."""
 
-    def test_default_ttl_is_zero(self):
-        """Default TTL should be 0 (disabled)."""
+    def test_default_ttl_is_fifteen_minutes(self):
+        """Default TTL should proactively compact stale sessions."""
         defaults = AgentDefaults()
+        assert defaults.session_ttl_minutes == 15
+
+    def test_explicit_zero_disables_ttl(self):
+        """Explicit 0 should still disable idle auto-compact."""
+        defaults = AgentDefaults(session_ttl_minutes=0)
         assert defaults.session_ttl_minutes == 0
 
     def test_custom_ttl(self):
@@ -188,7 +220,7 @@ class TestAgentLoopTTLParam:
         kwargs = session.get_history.call_args.kwargs
         assert isinstance(kwargs.get("max_tokens"), int)
         assert kwargs["max_tokens"] > 0
-        assert kwargs["include_timestamps"] is True
+        assert set(kwargs) == {"max_messages", "max_tokens", "extend_to_user"}
 
     @pytest.mark.asyncio
     async def test_session_file_cap_archives_and_trims_old_messages(self, tmp_path):
@@ -275,7 +307,7 @@ class TestAutoCompact:
         loop.sessions.save(s2)
 
         loop.consolidator.compact_idle_session = _make_fake_compact(loop)
-        loop.auto_compact.check_expired(loop._schedule_background)
+        loop.auto_compact.check_expired(loop._schedule_background, loop.llm_runtime)
         await _drain_background_tasks(loop)
 
         active_after = loop.sessions.get_or_create("cli:active")
@@ -296,13 +328,42 @@ class TestAutoCompact:
             loop, track_archived=archived_messages,
         )
 
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         assert len(archived_messages) == 4
         session_after = loop.sessions.get_or_create("cli:test")
         assert len(session_after.messages) == loop.auto_compact._RECENT_SUFFIX_MESSAGES
         assert session_after.messages[0]["content"] == "msg user 2"
         assert session_after.messages[-1]["content"] == "msg assistant 5"
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_auto_compact_extends_recent_suffix_to_user_turn(self, tmp_path):
+        loop = _make_loop(tmp_path, session_ttl_minutes=15)
+        session = loop.sessions.get_or_create("cli:test")
+        _add_turns(session, 2, prefix="old")
+        session.add_message("user", "record this")
+        for i in range(8):
+            _add_tool_turn(session, "recent", i)
+        session.add_message("assistant", "done")
+        loop.sessions.save(session)
+
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
+
+        session_after = loop.sessions.get_or_create("cli:test")
+        assert len(session_after.messages) > loop.auto_compact._RECENT_SUFFIX_MESSAGES
+        assert session_after.messages[0]["content"] == "record this"
+        assert session_after.messages[-1]["content"] == "done"
+        tool_results = {
+            m.get("tool_call_id")
+            for m in session_after.messages
+            if m.get("role") == "tool"
+        }
+        assert all(
+            tc["id"] in tool_results
+            for m in session_after.messages
+            for tc in (m.get("tool_calls") or [])
+        )
         await loop.close_mcp()
 
     @pytest.mark.asyncio
@@ -317,7 +378,7 @@ class TestAutoCompact:
             loop, summary="User said hello.",
         )
 
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         entry = loop.auto_compact._summaries.get("cli:test")
         assert entry is not None
@@ -333,7 +394,7 @@ class TestAutoCompact:
 
         loop.consolidator.compact_idle_session = _make_fake_compact(loop)
 
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         session_after = loop.sessions.get_or_create("cli:test")
         assert len(session_after.messages) == 0
@@ -354,7 +415,7 @@ class TestAutoCompact:
             loop, track_archived=archived_messages,
         )
 
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         assert len(archived_messages) == 2
         await loop.close_mcp()
@@ -394,7 +455,7 @@ class TestAutoCompactIdleDetection:
         )
 
         # Simulate proactive archive completing before message arrives
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="new msg")
         await loop._process_message(msg)
@@ -518,7 +579,7 @@ class TestAutoCompactSystemMessages:
         loop.consolidator.compact_idle_session = _make_fake_compact(loop)
 
         # Simulate proactive archive completing before system message arrives
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         msg = InboundMessage(
             channel="system", sender_id="subagent", chat_id="cli:test",
@@ -550,7 +611,7 @@ class TestAutoCompactEdgeCases:
             return_value=LLMResponse(content="(nothing)", tool_calls=[])
         )
 
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         session_after = loop.sessions.get_or_create("cli:test")
         assert len(session_after.messages) == loop.auto_compact._RECENT_SUFFIX_MESSAGES
@@ -571,7 +632,7 @@ class TestAutoCompactEdgeCases:
         loop.provider.chat_with_retry = AsyncMock(side_effect=Exception("API down"))
 
         # Should not raise
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         session_after = loop.sessions.get_or_create("cli:test")
         assert len(session_after.messages) == loop.auto_compact._RECENT_SUFFIX_MESSAGES
@@ -598,7 +659,7 @@ class TestAutoCompactEdgeCases:
         )
 
         # Simulate proactive archive completing before message arrives
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="continue")
         await loop._process_message(msg)
@@ -690,7 +751,7 @@ class TestAutoCompactIntegration:
         loop.consolidator.compact_idle_session = _make_fake_compact(loop)
 
         # Simulate proactive archive completing before message arrives
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         msg = InboundMessage(
             channel="cli", sender_id="user", chat_id="test",
@@ -715,6 +776,7 @@ class TestProactiveAutoCompact:
         """Helper: run check_expired via callback and wait for background tasks."""
         loop.auto_compact.check_expired(
             loop._schedule_background,
+            loop.llm_runtime,
             active_session_keys=active_session_keys,
         )
         await _drain_background_tasks(loop)
@@ -806,7 +868,7 @@ class TestProactiveAutoCompact:
         started = asyncio.Event()
         block_forever = asyncio.Event()
 
-        async def _slow_compact(key, max_suffix=8):
+        async def _slow_compact(key, *, runtime, max_suffix=8):
             nonlocal archive_count
             archive_count += 1
             started.set()
@@ -816,12 +878,12 @@ class TestProactiveAutoCompact:
         loop.consolidator.compact_idle_session = _slow_compact
 
         # First call starts archiving via callback
-        loop.auto_compact.check_expired(loop._schedule_background)
+        loop.auto_compact.check_expired(loop._schedule_background, loop.llm_runtime)
         await started.wait()
         assert archive_count == 1
 
         # Second call should skip (key is in _archiving)
-        loop.auto_compact.check_expired(loop._schedule_background)
+        loop.auto_compact.check_expired(loop._schedule_background, loop.llm_runtime)
         assert archive_count == 1
 
         # Clean up
@@ -838,7 +900,7 @@ class TestProactiveAutoCompact:
         session.updated_at = datetime.now() - timedelta(minutes=20)
         loop.sessions.save(session)
 
-        async def _failing_compact(key, max_suffix=8):
+        async def _failing_compact(key, *, runtime, max_suffix=8):
             raise RuntimeError("LLM down")
 
         loop.consolidator.compact_idle_session = _failing_compact
@@ -957,27 +1019,28 @@ class TestProactiveAutoCompact:
         await self._run_check_expired(loop)
         assert _fake_compact.state["count"] == 1
 
-        # Second tick: should NOT re-schedule (updated_at is fresh after clear)
+        # Second tick: should NOT re-schedule because the session has no removable tail.
         await self._run_check_expired(loop)
         assert _fake_compact.state["count"] == 1  # Still 1, not re-scheduled
         await loop.close_mcp()
 
     @pytest.mark.asyncio
-    async def test_empty_skip_refreshes_updated_at_prevents_reschedule(self, tmp_path):
-        """Empty session skip refreshes updated_at, preventing immediate re-scheduling."""
+    async def test_empty_session_does_not_schedule_idle_compact(self, tmp_path):
+        """Empty expired sessions have no removable tail and should not schedule."""
         loop = _make_loop(tmp_path, session_ttl_minutes=15)
         session = loop.sessions.get_or_create("cli:test")
         session.updated_at = datetime.now() - timedelta(minutes=20)
         loop.sessions.save(session)
 
-        loop.consolidator.compact_idle_session = _make_fake_compact(loop)
+        _fake_compact = _make_fake_compact(loop)
+        loop.consolidator.compact_idle_session = _fake_compact
 
-        # First tick: skips (no messages), refreshes updated_at
         await self._run_check_expired(loop)
+        assert _fake_compact.state["count"] == 0
         assert "cli:test" not in loop.auto_compact._summaries
 
-        # Second tick: should NOT re-schedule because updated_at is fresh
         await self._run_check_expired(loop)
+        assert _fake_compact.state["count"] == 0
         assert "cli:test" not in loop.auto_compact._summaries
         await loop.close_mcp()
 
@@ -994,7 +1057,7 @@ class TestProactiveAutoCompact:
         loop.consolidator.compact_idle_session = _fake_compact
 
         # First compact cycle
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
         assert _fake_compact.state["count"] == 1
 
         # User returns, sends new messages
@@ -1008,7 +1071,7 @@ class TestProactiveAutoCompact:
         loop.sessions.save(session2)
 
         # Second compact cycle should succeed
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
         assert _fake_compact.state["count"] == 2
         await loop.close_mcp()
 
@@ -1029,7 +1092,7 @@ class TestSummaryPersistence:
             loop, summary="User said hello.",
         )
 
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         # Summary should be persisted in session metadata
         session_after = loop.sessions.get_or_create("cli:test")
@@ -1054,7 +1117,7 @@ class TestSummaryPersistence:
         )
 
         # Archive
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         # Simulate restart: clear in-memory state
         loop.auto_compact._summaries.clear()
@@ -1083,7 +1146,7 @@ class TestSummaryPersistence:
 
         loop.consolidator.compact_idle_session = _make_fake_compact(loop)
 
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         # Clear in-memory to force metadata path
         loop.auto_compact._summaries.clear()
@@ -1111,7 +1174,7 @@ class TestSummaryPersistence:
 
         loop.consolidator.compact_idle_session = _make_fake_compact(loop)
 
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         # Both _summaries and metadata have the summary
         assert "cli:test" in loop.auto_compact._summaries
@@ -1138,7 +1201,7 @@ class TestSummaryPersistence:
         loop.consolidator.compact_idle_session = _make_fake_compact(
             loop, summary="First summary.",
         )
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         # Consume the first summary via hot path
         _, summary1 = loop.auto_compact.prepare_session(
@@ -1156,7 +1219,7 @@ class TestSummaryPersistence:
         loop.consolidator.compact_idle_session = _make_fake_compact(
             loop, summary="Second summary.",
         )
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         # The second archive writes a new summary
         assert "cli:test" in loop.auto_compact._summaries
@@ -1180,7 +1243,7 @@ class TestSummaryPersistence:
         loop.consolidator.compact_idle_session = _make_fake_compact(
             loop, summary="Old summary.",
         )
-        await loop.auto_compact._archive("cli:test")
+        await loop.auto_compact._archive("cli:test", runtime=loop.llm_runtime())
 
         # Verify summary exists before /new
         reloaded = loop.sessions.get_or_create("cli:test")

@@ -4,6 +4,8 @@ import { useTranslation } from "react-i18next";
 
 import { useThemeValue } from "@/hooks/useTheme";
 import { hasAnsi, parseAnsiSegments, stripAnsi } from "@/lib/ansi";
+import { copyTextToClipboard } from "@/lib/clipboard";
+import { normalizeCodeLanguage } from "@/lib/code-language";
 import { cn } from "@/lib/utils";
 
 interface CodeBlockProps {
@@ -190,10 +192,11 @@ export function CodeBlock({
   const isDark = useThemeValue() === "dark";
   const hasChrome = chrome === "default";
   const renderAnsi = shouldRenderAnsi(language, code);
+  const syntaxLanguage = normalizeCodeLanguage(language);
 
   const onCopy = useCallback(() => {
-    if (!navigator.clipboard) return;
-    navigator.clipboard.writeText(renderAnsi ? stripAnsi(code) : code).then(() => {
+    void copyTextToClipboard(renderAnsi ? stripAnsi(code) : code).then((ok) => {
+      if (!ok) return;
       setCopied(true);
       setTimeout(() => setCopied(false), 1_500);
     });
@@ -260,7 +263,7 @@ export function CodeBlock({
           }
         >
           <LazyHighlightedCode
-            language={language}
+            language={syntaxLanguage}
             code={code}
             isDark={isDark}
             chrome={chrome}

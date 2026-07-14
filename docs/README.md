@@ -1,39 +1,84 @@
-# nanobot Docs
+# nanobot Documentation
 
-For the latest documentation, visit [nanobot.wiki](https://nanobot.wiki/docs/latest/getting-started/nanobot-overview).
+Use these docs to get a working agent first, then open a task guide only when you need the next capability. Source-level design and extension details are kept in the contributor section.
 
-The pages in this directory track the current repository and may move faster than the published website.
+Repository docs follow the current source tree and can be newer than the latest package release. For published release docs, visit [nanobot.wiki](https://nanobot.wiki/docs/latest/getting-started/nanobot-overview).
 
-## Core Docs
+## Start Here
 
-Start here for setup, everyday usage, and deployment.
-
-| Topic | Repo docs | What it covers |
+| Your situation | Read this | You are done when... |
 |---|---|---|
-| Install and quick start | [`quick-start.md`](./quick-start.md) | Installation, onboarding, and first-run setup |
-| Chat apps | [`chat-apps.md`](./chat-apps.md) | Connect nanobot to Telegram, Discord, WeChat, and more |
-| Agent social network | [`agent-social-network.md`](./agent-social-network.md) | Join external agent communities from nanobot |
-| Configuration | [`configuration.md`](./configuration.md) | Providers, tools, channels, MCP, and runtime settings |
-| Image generation | [`image-generation.md`](./image-generation.md) | Configure image providers, WebUI image mode, and generated artifacts |
-| WebUI | [`../webui/README.md`](../webui/README.md) | Open the bundled browser UI; LAN access; Vite dev server for contributors |
-| Multiple instances | [`multiple-instances.md`](./multiple-instances.md) | Run isolated bots with separate configs and workspaces |
-| CLI reference | [`cli-reference.md`](./cli-reference.md) | Core CLI commands and common entrypoints |
-| In-chat commands | [`chat-commands.md`](./chat-commands.md) | Slash commands and periodic task behavior |
-| OpenAI-compatible API | [`openai-api.md`](./openai-api.md) | Local API endpoints, request format, and file uploads |
-| Deployment | [`deployment.md`](./deployment.md) | Docker, Linux service, and macOS LaunchAgent setup |
+| Terminals, Python, or API keys are new to you | [Beginner walkthrough](./start-without-technical-background.md) | The browser can send `Hello!` and receive a reply |
+| You are comfortable running commands | [Install and Quick Start](./quick-start.md) | `nanobot status` is healthy and the WebUI or CLI can get one reply |
+| Something already failed | [Troubleshooting](./troubleshooting.md) | You have isolated the problem to install, config, model, gateway, channel, or tool access |
 
-## Advanced Docs
+The recommended first-run path is:
 
-Use these when you want deeper customization, integration, or extension details.
+1. Install nanobot.
+2. Choose **Quick Start** in `nanobot onboard --wizard`.
+3. Run `nanobot gateway` and open `http://127.0.0.1:8765`.
+4. Send `Hello!` before configuring anything else.
 
-| Topic | Repo docs | What it covers |
-|---|---|---|
-| Development | [`development.md`](./development.md) | Contributor notes for adding providers and transcription adapters |
-| Memory | [`memory.md`](./memory.md) | How nanobot stores, consolidates, and restores memory |
-| Agent loop | [`agent-loop.md`](./agent-loop.md) | How one turn moves through observe, think, act, and state update |
-| Tool system | [`tool-system.md`](./tool-system.md) | How tools are defined, registered, executed, and fed back into the loop |
-| Context system | [`context-system.md`](./context-system.md) | How nanobot assembles, governs, restores, and persists runtime context |
-| Python SDK | [`python-sdk.md`](./python-sdk.md) | Use nanobot programmatically from Python |
-| Channel plugin guide | [`channel-plugin-guide.md`](./channel-plugin-guide.md) | Build and test custom chat channel plugins |
-| WebSocket channel | [`websocket.md`](./websocket.md) | Real-time WebSocket access and protocol details |
-| Custom tools | [`my-tool.md`](./my-tool.md) | Inspect and tune runtime state with the `my` tool |
+Most people do not need to edit JSON for the first run. The wizard handles the initial provider, model, and local WebUI settings. Current source versions also provide `nanobot webui` to start the gateway and open the browser in one step. After the WebUI opens, use **Settings** for models and built-in capabilities, **Settings → Channels** for chat apps, and **Apps** for CLI App or MCP integrations.
+
+## Add One Capability
+
+Pick the row that matches what you want to accomplish next:
+
+| Goal | Guide |
+|---|---|
+| Learn the browser workbench | [WebUI](./webui.md) |
+| Connect Telegram, Discord, Slack, Feishu, WeChat, Email, or another chat app | [Chat Apps](./chat-apps.md) |
+| Choose a hosted, OAuth, company, or local model | [Provider Cookbook](./provider-cookbook.md) |
+| Add model fallbacks | [Configure Model Fallback](./guides/configure-model-fallback.md) |
+| Enable web search | [Configure Web Search](./guides/configure-web-search.md) |
+| Add an MCP tool server | [Configure MCP Tools](./guides/configure-mcp-tools.md) |
+| Generate images | [Image Generation](./image-generation.md) |
+| Schedule work or create a local trigger | [Automations](./automations.md) |
+| Understand and manage long-term memory | [Memory](./memory.md) |
+| Run nanobot continuously | [Deployment](./deployment.md) |
+| Run separate bots or workspaces | [Multiple Instances](./multiple-instances.md) |
+| Call nanobot from Python | [Python SDK](./python-sdk.md) |
+| Expose an OpenAI-compatible endpoint | [OpenAI-Compatible API](./openai-api.md) |
+
+For shorter, outcome-focused walkthroughs, browse the [task guide index](./guides/README.md).
+
+## Operate nanobot
+
+| Need | Read |
+|---|---|
+| Commands and flags | [CLI Reference](./cli-reference.md) |
+| In-chat slash commands | [In-Chat Commands](./chat-commands.md) |
+| Config, workspace, gateway, sessions, tools, and memory in plain language | [Concepts](./concepts.md) |
+| Provider/model matching and selection | [Providers and Models](./providers.md) |
+| Setup and runtime diagnosis | [Troubleshooting](./troubleshooting.md) |
+| Older development highlights | [Release Archive](./release-archive.md) |
+
+## Reference
+
+Use reference pages to look up an exact option after you know what you are trying to configure:
+
+| Area | Reference |
+|---|---|
+| Every configuration field and default | [Configuration](./configuration.md) |
+| Provider and model behavior | [Providers and Models](./providers.md) |
+| Chat channel prerequisites and manual JSON | [Chat Apps](./chat-apps.md) |
+| WebSocket authentication and wire protocol | [WebSocket](./websocket.md) |
+| Python SDK classes, events, sessions, and hooks | [Python SDK](./python-sdk.md) |
+| OpenAI-compatible HTTP routes and payloads | [OpenAI-Compatible API](./openai-api.md) |
+| Runtime self-inspection and tuning | [My Tool](./my-tool.md) |
+
+Configuration examples are usually snippets to merge into `~/.nanobot/config.json`, not complete replacement files. The docs use camelCase because nanobot writes config that way. Keep real API keys, bot tokens, and passwords out of issues and public logs.
+
+## Extend or Contribute
+
+These pages explain implementation and extension points. You do not need them to install or operate nanobot.
+
+| Goal | Read |
+|---|---|
+| Understand source ownership and runtime flow | [Architecture](./architecture.md) |
+| Set up a development environment | [Development](./development.md) and [CONTRIBUTING.md](../CONTRIBUTING.md) |
+| Add a channel package | [Channel Plugin Guide](./channel-plugin-guide.md) |
+| Build the WebUI source | [WebUI Development](../webui/README.md) |
+
+If a command or screen no longer matches these docs, please [open an issue](https://github.com/HKUDS/nanobot/issues) with your nanobot version, operating system, and the page that needs correction.

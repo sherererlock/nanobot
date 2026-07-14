@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import datetime as datetime_module
 import re
 from datetime import datetime as real_datetime
 from importlib.resources import files as pkg_files
 from pathlib import Path
-import datetime as datetime_module
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.runtime_context import RuntimeContextBlock
 
 
 class _FakeDatetime(real_datetime):
@@ -61,34 +62,7 @@ def test_system_prompt_reflects_current_dream_memory_contract(tmp_path) -> None:
     assert "write important facts here" not in prompt
 
 
-def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
-    """Runtime metadata should be merged with the user message."""
-    workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
-    messages = builder.build_messages(
-        history=[],
-        current_message="Return exactly: OK",
-        channel="cli",
-        chat_id="direct",
-    )
-
-    assert messages[0]["role"] == "system"
-    assert "## Current Session" not in messages[0]["content"]
-
-    # Runtime context is now merged with user message into a single message
-    assert messages[-1]["role"] == "user"
-    user_content = messages[-1]["content"]
-    assert isinstance(user_content, str)
-    assert ContextBuilder._RUNTIME_CONTEXT_TAG in user_content
-    assert "Current Time:" in user_content
-    assert "Channel: cli" in user_content
-    assert "Chat ID: direct" in user_content
-    assert "Return exactly: OK" in user_content
-
-
-def test_runtime_context_appended_after_user_content(tmp_path) -> None:
-    """User content must precede runtime context for prompt-cache prefix stability."""
+def test_provider_context_appended_after_user_content(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
@@ -97,48 +71,15 @@ def test_runtime_context_appended_after_user_content(tmp_path) -> None:
         current_message="hello world",
         channel="cli",
         chat_id="direct",
+        runtime_context_blocks=[
+            RuntimeContextBlock(source="test", content="provider context"),
+        ],
     )
 
     content = messages[-1]["content"]
     user_pos = content.find("hello world")
-    tag_pos = content.find(ContextBuilder._RUNTIME_CONTEXT_TAG)
-    assert user_pos < tag_pos, "user content must precede runtime context for prefix stability"
-
-
-def test_runtime_context_includes_sender_id_when_provided(tmp_path) -> None:
-    """Sender ID should be included in runtime context when provided."""
-    workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
-    messages = builder.build_messages(
-        history=[],
-        current_message="Return exactly: OK",
-        channel="cli",
-        chat_id="direct",
-        sender_id="user-12345",
-    )
-
-    user_content = messages[-1]["content"]
-    assert isinstance(user_content, str)
-    assert "Sender ID: user-12345" in user_content
-
-
-def test_runtime_context_excludes_sender_id_when_not_provided(tmp_path) -> None:
-    """Sender ID should not be present in runtime context when not provided."""
-    workspace = _make_workspace(tmp_path)
-    builder = ContextBuilder(workspace)
-
-    messages = builder.build_messages(
-        history=[],
-        current_message="Return exactly: OK",
-        channel="cli",
-        chat_id="direct",
-        sender_id=None,
-    )
-
-    user_content = messages[-1]["content"]
-    assert isinstance(user_content, str)
-    assert "Sender ID:" not in user_content
+    context_pos = content.find("provider context")
+    assert user_pos < context_pos, "user content must precede provider context"
 
 
 def test_unprocessed_history_injected_into_system_prompt(tmp_path) -> None:
@@ -156,6 +97,58 @@ def test_unprocessed_history_injected_into_system_prompt(tmp_path) -> None:
     assert re.search(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]", prompt)
 
 
+def test_recent_history_injection_is_session_scoped(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    builder.memory.append_history("legacy entry without session")
+    builder.memory.append_history("telegram history", session_key="telegram:chat-1")
+    builder.memory.append_history("slack history", session_key="slack:chat-2")
+
+    prompt = builder.build_system_prompt(session_key="telegram:chat-1")
+
+    assert "# Recent History" in prompt
+    assert "telegram history" in prompt
+    assert "slack history" not in prompt
+    assert "legacy entry without session" not in prompt
+
+
+def test_recent_history_injection_unified_excludes_cron_internals(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    builder.memory.append_history("unified user history", session_key="unified:default")
+    builder.memory.append_history("channel user history", session_key="telegram:chat-1")
+    builder.memory.append_history("cron internal history", session_key="cron:job-1")
+
+    prompt = builder.build_system_prompt(
+        session_key="unified:default",
+        unified_session=True,
+    )
+
+    assert "unified user history" in prompt
+    assert "channel user history" in prompt
+    assert "cron internal history" not in prompt
+
+
+def test_cron_recent_history_can_see_own_history_and_unified_context(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    builder.memory.append_history("unified user history", session_key="unified:default")
+    builder.memory.append_history("own cron history", session_key="cron:job-1")
+    builder.memory.append_history("other cron history", session_key="cron:job-2")
+
+    prompt = builder.build_system_prompt(
+        session_key="cron:job-1",
+        unified_session=True,
+    )
+
+    assert "unified user history" in prompt
+    assert "own cron history" in prompt
+    assert "other cron history" not in prompt
+
+
 def test_recent_history_capped_at_max(tmp_path) -> None:
     """Only the most recent _MAX_RECENT_HISTORY entries are injected."""
     workspace = _make_workspace(tmp_path)
@@ -170,18 +163,22 @@ def test_recent_history_capped_at_max(tmp_path) -> None:
     assert f"entry-{builder._MAX_RECENT_HISTORY + 19}" in prompt
 
 
-def test_recent_history_truncated_at_max_chars(tmp_path) -> None:
-    """Recent History section must be truncated at _MAX_HISTORY_CHARS."""
+def test_recent_history_truncated_at_max_tokens(tmp_path) -> None:
+    """Recent History section must be truncated to _MAX_HISTORY_TOKENS."""
+    import tiktoken
+
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    big_entry = "x" * (builder._MAX_HISTORY_CHARS + 5_000)
+    big_entry = "word " * (builder._MAX_HISTORY_TOKENS + 5_000)
     builder.memory.append_history(big_entry)
 
     prompt = builder.build_system_prompt()
     history_section = prompt.split("# Recent History\n\n", 1)
     assert len(history_section) == 2
-    assert len(history_section[1]) < builder._MAX_HISTORY_CHARS + 200
+
+    enc = tiktoken.get_encoding("cl100k_base")
+    assert len(enc.encode(history_section[1])) <= builder._MAX_HISTORY_TOKENS
 
 
 def test_no_recent_history_when_dream_has_processed_all(tmp_path) -> None:
@@ -201,7 +198,7 @@ def test_partial_dream_processing_shows_only_remainder(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    c1 = builder.memory.append_history("old conversation about Python")
+    builder.memory.append_history("old conversation about Python")
     c2 = builder.memory.append_history("old conversation about Rust")
     builder.memory.append_history("recent question about Docker")
     builder.memory.append_history("recent question about K8s")

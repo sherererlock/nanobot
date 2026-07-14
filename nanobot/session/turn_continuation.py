@@ -22,17 +22,16 @@ INTERNAL_CONTINUATION_META = "_internal_continuation"
 INTERNAL_CONTINUATION_KIND_META = "_internal_continuation_kind"
 INTERNAL_CONTINUATION_PENDING_META = "_internal_continuation_pending"
 INTERNAL_CONTINUATION_RUN_STARTED_AT_META = "_internal_continuation_run_started_at"
+SKIP_USER_PERSIST_META = "_skip_user_persist"
 
 _GOAL_CONTINUATION_KIND = "sustained_goal"
 _GOAL_CONTINUATION_SENDER = "system:continuation"
 _GOAL_CONTINUATION_ROUNDS_KEY = "_sustained_goal_continuation_rounds"
 _MAX_GOAL_CONTINUATION_ROUNDS = 12
 _STRIPPED_INBOUND_META_KEYS = {
-    "_stream_id",
-    "_stream_delta",
-    "_stream_end",
-    "_resuming",
     INTERNAL_CONTINUATION_PENDING_META,
+    "goal_requested",
+    "original_command",
 }
 
 
@@ -59,6 +58,8 @@ def internal_continuation_run_started_at(metadata: Mapping[str, Any] | None) -> 
 
 def should_persist_user_message(metadata: Mapping[str, Any] | None) -> bool:
     """Return whether this inbound message should be persisted as user input."""
+    if metadata and metadata.get(SKIP_USER_PERSIST_META) is True:
+        return False
     return not internal_continuation_inbound(metadata)
 
 
@@ -70,11 +71,33 @@ def should_stream_budget_response(
     message_metadata: Mapping[str, Any] | None = None,
 ) -> bool:
     """Return whether the budget-boundary response should be sent to the user."""
-    return not _continuation_available(
-        stop_reason=stop_reason,
+    if stop_reason != "max_iterations":
+        return True
+    return should_finalize_on_max_iterations(
         pending_queue_available=pending_queue_available,
         session_metadata=session_metadata,
         message_metadata=message_metadata,
+    )
+
+
+def should_finalize_on_max_iterations(
+    *,
+    pending_queue_available: bool,
+    session_metadata: Mapping[str, Any] | None,
+    message_metadata: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return whether a max-iteration boundary should produce a final response.
+
+    When a sustained goal can continue internally, the current runner slice
+    should stop without spending an extra no-tools finalization call. The next
+    queued continuation slice owns the eventual user-visible response.
+    """
+    return not (
+        pending_queue_available
+        and _goal_continuation_available(
+            session_metadata,
+            message_metadata=message_metadata,
+        )
     )
 
 
@@ -147,7 +170,12 @@ def _continuation_available(
 def clear_internal_continuation_state(metadata: MutableMapping[str, Any]) -> None:
     """Reset policy bookkeeping once its owning runtime mode is inactive."""
     if not sustained_goal_active(metadata):
-        metadata.pop(_GOAL_CONTINUATION_ROUNDS_KEY, None)
+        reset_goal_continuation_rounds(metadata)
+
+
+def reset_goal_continuation_rounds(metadata: MutableMapping[str, Any]) -> None:
+    """Start a newly created or replaced goal with a fresh continuation budget."""
+    metadata.pop(_GOAL_CONTINUATION_ROUNDS_KEY, None)
 
 
 def _save_skip_for_turn(
@@ -158,9 +186,16 @@ def _save_skip_for_turn(
     user_persisted_early: bool,
 ) -> int:
     """Return the persisted-message append boundary for this turn."""
+    if message_metadata and message_metadata.get(SKIP_USER_PERSIST_META) is True:
+        return initial_message_count
     if internal_continuation_inbound(message_metadata):
         return initial_message_count
-    return 1 + history_count + (1 if user_persisted_early else 0)
+    # build_messages may merge the current message into a same-role history tail.
+    # Runner-appended messages start at initial_message_count in either shape.
+    has_standalone_current = initial_message_count > 1 + history_count
+    if has_standalone_current and not user_persisted_early:
+        return initial_message_count - 1
+    return initial_message_count
 
 
 def _goal_continuation_available(
@@ -212,14 +247,14 @@ def _goal_continuation_prompt(metadata: Mapping[str, Any] | None) -> str:
             "its tool-call budget.\n\n"
             f"{goal}\n\n"
             "Continue from the saved context. Do not mention the continuation "
-            "boundary to the user. Use tools as needed, and call complete_goal "
-            "when the objective is truly finished."
+            "boundary to the user. Use tools as needed, and call update_goal "
+            "with action='complete' when the objective is truly finished."
         )
     return (
         "Continue the active sustained goal after the previous turn reached "
         "its tool-call budget. Continue from the saved context. Do not mention "
         "the continuation boundary to the user. Use tools as needed, and call "
-        "complete_goal when the objective is truly finished."
+        "update_goal with action='complete' when the objective is truly finished."
     )
 
 

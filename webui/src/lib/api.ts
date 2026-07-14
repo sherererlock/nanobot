@@ -1,14 +1,23 @@
 import type {
+  ApiServicePayload,
+  AutomationsPayload,
+  AutomationUpdatePayload,
+  ChannelConfigurePayload,
+  ChannelConnectPayload,
+  ChannelValidationPayload,
   ChatSummary,
   CliAppsPayload,
   FilePreviewPayload,
   ImageGenerationSettingsUpdate,
   McpPresetsPayload,
+  NanobotFeaturesPayload,
   ModelConfigurationCreate,
   ModelConfigurationUpdate,
   NetworkSafetySettingsUpdate,
+  PairingPayload,
   ProviderModelsPayload,
   ProviderSettingsUpdate,
+  SessionDeleteResult,
   SessionAutomationsPayload,
   SettingsPayload,
   SettingsUpdate,
@@ -16,6 +25,7 @@ import type {
   SkillDetail,
   SkillsPayload,
   SlashCommand,
+  SlashCommandLifecycle,
   TranscriptionSettingsUpdate,
   WebSearchSettingsUpdate,
   WorkspacesPayload,
@@ -25,6 +35,22 @@ import type {
 import { fetchWithTimeout } from "./http";
 
 const API_READ_TIMEOUT_MS = 20_000;
+const SLASH_COMMAND_LIFECYCLES = new Set<SlashCommandLifecycle>([
+  "side_channel",
+  "finalize_active_turn",
+  "stop_active_turn",
+  "agent_turn",
+  "agent_turn_with_args",
+]);
+
+function isSlashCommandLifecycle(value: unknown): value is SlashCommandLifecycle {
+  return (
+    typeof value === "string"
+    && SLASH_COMMAND_LIFECYCLES.has(value as SlashCommandLifecycle)
+  );
+}
+const CHANNEL_VALUES_HEADER = "X-Nanobot-Channel-Values";
+const API_SERVICE_VALUES_HEADER = "X-Nanobot-API-Service-Values";
 
 export class ApiError extends Error {
   status: number;
@@ -86,6 +112,10 @@ function mcpValuesHeader(values: Record<string, unknown>): HeadersInit | undefin
   return { "X-Nanobot-MCP-Values": JSON.stringify(payload) };
 }
 
+function automationValuesHeader(values: AutomationUpdatePayload): HeadersInit {
+  return { "X-Nanobot-Automation-Values": encodeURIComponent(JSON.stringify(values)) };
+}
+
 function splitKey(key: string): { channel: string; chatId: string } {
   const idx = key.indexOf(":");
   if (idx === -1) return { channel: "", chatId: key };
@@ -124,12 +154,27 @@ export async function listSessions(
 }
 
 /** Disk-backed WebUI display thread snapshot (separate from agent session). */
+export interface FetchWebuiThreadOptions {
+  limit?: number;
+  direction?: "latest";
+  before?: string | null;
+}
+
 export async function fetchWebuiThread(
   token: string,
   key: string,
+  optionsOrBase?: FetchWebuiThreadOptions | string,
   base: string = "",
 ): Promise<WebuiThreadPersistedPayload | null> {
-  const url = `${base}/api/sessions/${encodeURIComponent(key)}/webui-thread`;
+  const options = typeof optionsOrBase === "string" ? undefined : optionsOrBase;
+  const resolvedBase = typeof optionsOrBase === "string" ? optionsOrBase : base;
+  const params = new URLSearchParams();
+  if (options?.limit !== undefined) params.set("limit", String(options.limit));
+  if (options?.direction) params.set("direction", options.direction);
+  if (options?.before) params.set("before", options.before);
+  const query = params.toString();
+  const suffix = query ? `?${query}` : "";
+  const url = `${resolvedBase}/api/sessions/${encodeURIComponent(key)}/webui-thread${suffix}`;
   const res = await fetchWithTimeout(url, {
     headers: { Authorization: `Bearer ${token}` },
     credentials: "same-origin",
@@ -168,6 +213,52 @@ export async function fetchSessionAutomations(
   );
 }
 
+export async function fetchAutomations(
+  token: string,
+  base: string = "",
+): Promise<AutomationsPayload> {
+  return request<AutomationsPayload>(
+    `${base}/api/webui/automations`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
+}
+
+export async function runAutomationAction(
+  token: string,
+  action: "enable" | "disable" | "delete" | "run",
+  id: string,
+  base: string = "",
+): Promise<AutomationsPayload> {
+  const query = new URLSearchParams();
+  query.set("id", id);
+  return request<AutomationsPayload>(
+    `${base}/api/webui/automations/${action}?${query}`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
+}
+
+export async function updateAutomation(
+  token: string,
+  id: string,
+  values: AutomationUpdatePayload,
+  base: string = "",
+): Promise<AutomationsPayload> {
+  const query = new URLSearchParams();
+  query.set("id", id);
+  return request<AutomationsPayload>(
+    `${base}/api/webui/automations/update?${query}`,
+    token,
+    {
+      headers: automationValuesHeader(values),
+    },
+    API_READ_TIMEOUT_MS,
+  );
+}
+
 export async function fetchSkills(
   token: string,
   base: string = "",
@@ -196,13 +287,18 @@ export async function fetchSkillDetail(
 export async function deleteSession(
   token: string,
   key: string,
+  optionsOrBase?: { deleteAutomations?: boolean } | string,
   base: string = "",
-): Promise<boolean> {
-  const body = await request<{ deleted: boolean }>(
-    `${base}/api/sessions/${encodeURIComponent(key)}/delete`,
+): Promise<SessionDeleteResult> {
+  const options = typeof optionsOrBase === "string" ? undefined : optionsOrBase;
+  const resolvedBase = typeof optionsOrBase === "string" ? optionsOrBase : base;
+  const query = new URLSearchParams();
+  if (options?.deleteAutomations) query.set("delete_automations", "true");
+  const suffix = query.toString() ? `?${query}` : "";
+  return request<SessionDeleteResult>(
+    `${resolvedBase}/api/sessions/${encodeURIComponent(key)}/delete${suffix}`,
     token,
   );
-  return body.deleted;
 }
 
 export async function fetchSettings(
@@ -229,6 +325,26 @@ export async function fetchSettingsUsage(
   );
 }
 
+export interface VersionCheckResult {
+  updateAvailable: {
+    currentVersion: string;
+    latestVersion: string;
+    pypiUrl?: string;
+  } | null;
+}
+
+export async function checkVersion(
+  token: string,
+  base: string = "",
+): Promise<VersionCheckResult> {
+  return request<VersionCheckResult>(
+    `${base}/api/settings/version-check`,
+    token,
+    undefined,
+    10_000,
+  );
+}
+
 export async function fetchWorkspaces(
   token: string,
   base: string = "",
@@ -250,6 +366,208 @@ export async function fetchCliApps(
     token,
     undefined,
     API_READ_TIMEOUT_MS,
+  );
+}
+
+export async function fetchInstalledCliApps(
+  token: string,
+  base: string = "",
+): Promise<CliAppsPayload> {
+  return request<CliAppsPayload>(
+    `${base}/api/settings/cli-apps?installed_only=1`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
+}
+
+export async function fetchNanobotFeatures(
+  token: string,
+  base: string = "",
+): Promise<NanobotFeaturesPayload> {
+  return request<NanobotFeaturesPayload>(
+    `${base}/api/settings/nanobot-features`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
+}
+
+export async function fetchApiService(token: string, base: string = ""): Promise<ApiServicePayload> {
+  return request<ApiServicePayload>(`${base}/api/settings/api-service`, token);
+}
+
+export async function startApiService(
+  token: string,
+  values: { host: string; port: number; timeout: number; apiKey?: string },
+  base: string = "",
+): Promise<ApiServicePayload> {
+  const query = new URLSearchParams({
+    host: values.host,
+    port: String(values.port),
+    timeout: String(values.timeout),
+  });
+  const headers = values.apiKey === undefined
+    ? undefined
+    : { [API_SERVICE_VALUES_HEADER]: JSON.stringify({ api_key: values.apiKey }) };
+  return request<ApiServicePayload>(
+    `${base}/api/settings/api-service/start?${query}`,
+    token,
+    { headers },
+  );
+}
+
+export async function stopApiService(token: string, base: string = ""): Promise<ApiServicePayload> {
+  return request<ApiServicePayload>(`${base}/api/settings/api-service/stop`, token);
+}
+
+export async function enableNanobotFeature(
+  token: string,
+  name: string,
+  options: { instanceId?: string } = {},
+  base: string = "",
+): Promise<NanobotFeaturesPayload> {
+  const query = new URLSearchParams();
+  query.set("name", name);
+  if (options.instanceId) query.set("instance_id", options.instanceId);
+  return request<NanobotFeaturesPayload>(
+    `${base}/api/settings/nanobot-features/enable?${query}`,
+    token,
+  );
+}
+
+export async function disableNanobotFeature(
+  token: string,
+  name: string,
+  options: { instanceId?: string } = {},
+  base: string = "",
+): Promise<NanobotFeaturesPayload> {
+  const query = new URLSearchParams();
+  query.set("name", name);
+  if (options.instanceId) query.set("instance_id", options.instanceId);
+  return request<NanobotFeaturesPayload>(
+    `${base}/api/settings/nanobot-features/disable?${query}`,
+    token,
+  );
+}
+
+export async function fetchPairingRequests(
+  token: string,
+  base: string = "",
+): Promise<PairingPayload> {
+  return request<PairingPayload>(
+    `${base}/api/settings/pairing`,
+    token,
+    undefined,
+    API_READ_TIMEOUT_MS,
+  );
+}
+
+export async function runPairingAction(
+  token: string,
+  action: "approve" | "deny",
+  code: string,
+  base: string = "",
+): Promise<PairingPayload> {
+  const query = new URLSearchParams();
+  query.set("code", code);
+  return request<PairingPayload>(
+    `${base}/api/settings/pairing/${action}?${query}`,
+    token,
+  );
+}
+
+export async function startChannelConnect(
+  token: string,
+  channel: "feishu" | "weixin",
+  options: {
+    domain?: "feishu" | "lark";
+    instanceId?: string;
+    mode?: "replace" | "create";
+    force?: boolean;
+  } = {},
+  base: string = "",
+): Promise<ChannelConnectPayload> {
+  const query = new URLSearchParams();
+  if (options.domain) query.set("domain", options.domain);
+  if (options.instanceId) query.set("instance_id", options.instanceId);
+  if (options.mode) query.set("mode", options.mode);
+  if (options.force) query.set("force", "true");
+  const suffix = query.toString();
+  return request<ChannelConnectPayload>(
+    `${base}/api/settings/channels/${channel}/connect/start${suffix ? `?${suffix}` : ""}`,
+    token,
+  );
+}
+
+export async function pollChannelConnect(
+  token: string,
+  channel: "feishu" | "weixin",
+  sessionId: string,
+  base: string = "",
+): Promise<ChannelConnectPayload> {
+  const query = new URLSearchParams();
+  query.set("session_id", sessionId);
+  return request<ChannelConnectPayload>(
+    `${base}/api/settings/channels/${channel}/connect/poll?${query}`,
+    token,
+  );
+}
+
+export async function cancelChannelConnect(
+  token: string,
+  channel: "feishu" | "weixin",
+  sessionId: string,
+  base: string = "",
+): Promise<ChannelConnectPayload> {
+  const query = new URLSearchParams();
+  query.set("session_id", sessionId);
+  return request<ChannelConnectPayload>(
+    `${base}/api/settings/channels/${channel}/connect/cancel?${query}`,
+    token,
+  );
+}
+
+export async function configureChannel(
+  token: string,
+  name: string,
+  values: Record<string, string>,
+  options: { enable?: boolean; instanceId?: string } = {},
+  base: string = "",
+): Promise<ChannelConfigurePayload> {
+  const query = new URLSearchParams();
+  query.set("name", name);
+  if (options.enable !== undefined) query.set("enable", String(options.enable));
+  if (options.instanceId) query.set("instance_id", options.instanceId);
+  return request<ChannelConfigurePayload>(
+    `${base}/api/settings/channels/configure?${query}`,
+    token,
+    {
+      headers: {
+        [CHANNEL_VALUES_HEADER]: JSON.stringify(values),
+      },
+    },
+  );
+}
+
+export async function validateChannel(
+  token: string,
+  name: string,
+  values: Record<string, string> = {},
+  options: { instanceId?: string } = {},
+  base: string = "",
+): Promise<ChannelValidationPayload> {
+  const query = new URLSearchParams();
+  query.set("name", name);
+  if (options.instanceId) query.set("instance_id", options.instanceId);
+  return request<ChannelValidationPayload>(
+    `${base}/api/settings/channels/validate?${query}`,
+    token,
+    {
+      headers: {
+        [CHANNEL_VALUES_HEADER]: JSON.stringify(values),
+      },
+    },
   );
 }
 
@@ -354,6 +672,8 @@ export async function listSlashCommands(
     description: string;
     icon: string;
     arg_hint?: string;
+    lifecycle?: unknown;
+    accepts_args?: unknown;
   };
   const body = await request<{ commands: Row[] }>(
     `${base}/api/commands`,
@@ -362,14 +682,18 @@ export async function listSlashCommands(
     API_READ_TIMEOUT_MS,
   );
   return body.commands
-    .filter((command) => !["/stop", "/restart"].includes(command.command))
-    .map((command) => ({
-      command: command.command,
-      title: command.title,
-      description: command.description,
-      icon: command.icon,
-      argHint: command.arg_hint ?? "",
-    }));
+    .flatMap((command) => {
+      if (!isSlashCommandLifecycle(command.lifecycle)) return [];
+      return [{
+        command: command.command,
+        title: command.title,
+        description: command.description,
+        icon: command.icon,
+        argHint: command.arg_hint ?? "",
+        lifecycle: command.lifecycle,
+        acceptsArgs: command.accepts_args === true,
+      }];
+    });
 }
 
 export async function fetchSidebarState(

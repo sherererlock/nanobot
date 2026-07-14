@@ -1,7 +1,6 @@
 # Tool Usage Notes
 
-Tool signatures are provided automatically via function calling. This section
-documents the general tool contract and non-obvious usage patterns.
+Tool signatures are provided automatically via function calling. This section documents the general tool contract and non-obvious usage patterns.
 
 ## General Tool Contract
 
@@ -27,7 +26,7 @@ documents the general tool contract and non-obvious usage patterns.
 - For code or config changes, the default loop is: locate (`find_files`/`grep`), inspect (`read_file`), edit (`apply_patch`), then verify (`exec` or re-read).
 - Use `apply_patch` as the default code editing tool, especially for multi-file changes, structural edits, generated code, moves, adds, or deletes.
 - Use `apply_patch dry_run=true` when the patch is uncertain and you want validation plus a change summary before writing.
-- Use `edit_file` only for small exact replacements in one file, with `old_text` copied from `read_file`; add `occurrence`, `line_hint`, or `expected_replacements` when ambiguity matters.
+- Use `edit_file` only for small exact replacements in one file, with `old_text` copied from `read_file`; when editing a specific numbered line, pass that exact line as `line_hint`; add `occurrence` or `expected_replacements` when ambiguity matters.
 - Use `write_file` for new files or intentional full-file rewrites, not routine partial edits.
 - If `apply_patch` or `edit_file` fails, re-read with `force=true`, narrow the context, and try a smaller patch rather than switching to shell `sed` or `echo`.
 
@@ -63,5 +62,5 @@ documents the general tool contract and non-obvious usage patterns.
 ## Scheduling and Background Work
 
 - Use `cron` for scheduled reminders or recurring jobs; do not run `nanobot cron` through `exec`.
-- For heartbeat tasks, register `HEARTBEAT.md` as a cron job according to the agent instructions.
+- For heartbeat tasks, update `HEARTBEAT.md`; the default gateway heartbeat cron job handles periodic checks when enabled.
 - Do not write reminders only to memory files when the user expects an actual notification.

@@ -8,9 +8,11 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
+import anyio
 import pytest
 from mcp import types as mcp_types
 from mcp.shared.exceptions import McpError
+from mcp.shared.message import SessionMessage
 from mcp.types import ErrorData
 
 from nanobot.agent.loop import AgentLoop
@@ -20,6 +22,36 @@ from nanobot.agent.tools.mcp import MCPResourceWrapper, MCPToolWrapper
 from nanobot.bus.queue import MessageBus
 from nanobot.config.loader import load_config, save_config
 from nanobot.config.schema import MCPServerConfig
+
+
+def _mcp_notification(method: str, params: dict[str, Any] | None = None) -> SessionMessage:
+    return SessionMessage(
+        message=mcp_types.JSONRPCMessage(
+            mcp_types.JSONRPCNotification(
+                jsonrpc="2.0",
+                method=method,
+                params=params,
+            )
+        )
+    )
+
+
+def test_mcp_progress_detection_accepts_flattened_sdk_message_shape():
+    malformed = SimpleNamespace(
+        message=SimpleNamespace(
+            method="notifications/progress",
+            params={"progress": 20, "total": 600},
+        )
+    )
+    valid = SimpleNamespace(
+        message=SimpleNamespace(
+            method="notifications/progress",
+            params={"progressToken": "req-1", "progress": 25},
+        )
+    )
+
+    assert mcp_runtime._is_malformed_mcp_progress_notification(malformed) is True
+    assert mcp_runtime._is_malformed_mcp_progress_notification(valid) is False
 
 
 class _FakeMcpTool(Tool):
@@ -57,6 +89,56 @@ def _make_loop(tmp_path, *, mcp_servers: dict | None = None) -> AgentLoop:
 
 
 @pytest.mark.asyncio
+async def test_mcp_read_filter_drops_progress_notifications_without_progress_token():
+    send, receive = anyio.create_memory_object_stream(4)
+    malformed_progress = _mcp_notification(
+        "notifications/progress",
+        {"progress": 20, "total": 600, "message": "Polling"},
+    )
+    tool_change = _mcp_notification("notifications/tools/list_changed")
+    valid_progress = _mcp_notification(
+        "notifications/progress",
+        {"progressToken": "req-1", "progress": 25, "total": 600, "message": "Polling"},
+    )
+
+    await send.send(malformed_progress)
+    await send.send(tool_change)
+    await send.send(valid_progress)
+    await send.aclose()
+
+    wrapped = mcp_runtime._filter_malformed_mcp_progress_notifications(receive, "brightdata")
+    forwarded = []
+    async with wrapped:
+        async for message in wrapped:
+            forwarded.append(message)
+
+    assert forwarded == [tool_change, valid_progress]
+
+
+@pytest.mark.asyncio
+async def test_owned_mcp_connection_closes_from_its_owner_task():
+    close_requested = asyncio.Event()
+    ready = asyncio.Event()
+    tasks: dict[str, asyncio.Task] = {}
+
+    async def own_connection() -> None:
+        tasks["open"] = asyncio.current_task()  # type: ignore[assignment]
+        ready.set()
+        await close_requested.wait()
+        tasks["close"] = asyncio.current_task()  # type: ignore[assignment]
+
+    owner = asyncio.create_task(own_connection())
+    connection = mcp_runtime._OwnedMCPConnection(owner, close_requested)
+    await ready.wait()
+
+    await connection.aclose()
+
+    assert tasks["open"] is owner
+    assert tasks["close"] is owner
+    assert tasks["close"] is not asyncio.current_task()
+
+
+@pytest.mark.asyncio
 async def test_connect_mcp_retries_when_no_servers_connect(tmp_path, monkeypatch: pytest.MonkeyPatch):
     loop = _make_loop(tmp_path)
     attempts = 0
@@ -72,8 +154,107 @@ async def test_connect_mcp_retries_when_no_servers_connect(tmp_path, monkeypatch
     await loop._connect_mcp()
 
     assert attempts == 2
-    assert loop._mcp_connected is False
     assert loop._mcp_stacks == {}
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_run_closes_mcp_from_connection_owner_task(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    loop = _make_loop(tmp_path, mcp_servers={"playwright": object()})
+    connected = asyncio.Event()
+    owner_tasks: list[asyncio.Task | None] = []
+    closed_tasks: list[asyncio.Task | None] = []
+
+    class _OwnerCheckedStack:
+        def __init__(self) -> None:
+            self.owner = asyncio.current_task()
+            owner_tasks.append(self.owner)
+
+        async def aclose(self) -> None:
+            closed_tasks.append(asyncio.current_task())
+            assert asyncio.current_task() is self.owner
+
+    async def _fake_connect(servers, _registry):
+        stacks = {name: _OwnerCheckedStack() for name in servers}
+        connected.set()
+        return stacks
+
+    monkeypatch.setattr("nanobot.agent.tools.mcp.connect_mcp_servers", _fake_connect)
+
+    task = asyncio.create_task(loop.run())
+    await asyncio.wait_for(connected.wait(), timeout=1)
+    loop.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert owner_tasks
+    assert closed_tasks == owner_tasks
+    assert loop._mcp_stacks == {}
+
+
+@pytest.mark.asyncio
+async def test_close_server_ignores_server_cancelled_error(tmp_path):
+    loop = _make_loop(tmp_path)
+
+    class _ServerCancelledStack:
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError()
+
+    loop._mcp_stacks = {"test": _ServerCancelledStack()}
+
+    await mcp_runtime._close_server(loop, "test")
+
+    assert loop._mcp_stacks == {}
+
+
+@pytest.mark.asyncio
+async def test_close_mcp_servers_continues_after_server_cancelled_error(tmp_path):
+    loop = _make_loop(tmp_path)
+    closed: list[str] = []
+
+    class _ServerCancelledStack:
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError()
+
+    class _TrackedStack:
+        async def aclose(self) -> None:
+            closed.append("second")
+
+    loop._mcp_stacks = {
+        "first": _ServerCancelledStack(),
+        "second": _TrackedStack(),
+    }
+
+    await mcp_runtime.close_mcp_servers(loop)
+
+    assert closed == ["second"]
+    assert loop._mcp_stacks == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_all", [False, True], ids=["single", "all"])
+async def test_mcp_cleanup_re_raises_external_cancellation(tmp_path, close_all: bool):
+    loop = _make_loop(tmp_path)
+    started = asyncio.Event()
+
+    class _BlockingStack:
+        async def aclose(self) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+    loop._mcp_stacks = {"test": _BlockingStack()}
+
+    if close_all:
+        task = asyncio.create_task(mcp_runtime.close_mcp_servers(loop))
+    else:
+        task = asyncio.create_task(mcp_runtime._close_server(loop, "test"))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 @pytest.mark.asyncio
