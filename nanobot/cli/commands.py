@@ -77,7 +77,7 @@ from nanobot.cli.stream import StreamRenderer, ThinkingSpinner  # noqa: E402
 from nanobot.config.paths import get_workspace_path, is_default_workspace  # noqa: E402
 from nanobot.config.schema import Config  # noqa: E402
 from nanobot.security.network import is_loopback_host  # noqa: E402
-from nanobot.utils.evaluator import evaluate_response  # noqa: E402
+from nanobot.utils.evaluator import evaluate_response, resolve_evaluator_prompt  # noqa: E402
 from nanobot.utils.helpers import sync_workspace_templates  # noqa: E402
 from nanobot.utils.restart import (  # noqa: E402
     consume_restart_notice_from_env,
@@ -1301,7 +1301,7 @@ def trigger(
     trigger_id: str = typer.Argument(..., help="Trigger ID returned by /trigger"),
     message: str | None = typer.Argument(None, help="Message to deliver; stdin is used when omitted"),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
 ):
     """Deliver a local trigger message to its bound chat session."""
     from nanobot.triggers.local_store import (
@@ -1859,21 +1859,29 @@ def _run_gateway(
             finally:
                 if isinstance(message_tool, MessageTool) and suppress_token is not None:
                     message_tool.reset_suppress_delivery(suppress_token)
-            response = resp.content if resp else ""
 
             # Keep a small tail of heartbeat history so the loop stays bounded.
             session = agent.sessions.get_or_create("heartbeat")
             session.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
             agent.sessions.save(session)
 
-            if not response:
-                return None
+            if not resp or not resp.content:
+                return
+
+            response = resp.content
+
+            evaluator_prompt = resolve_evaluator_prompt(config.workspace_path)
 
             # Fail closed: stay silent on evaluator failure instead of notifying.
             should_notify = await evaluate_response(
-                response, prompt, agent.provider, agent.model,
+                response=response,
+                task_context=prompt,
+                provider=agent.provider,
+                model=agent.model,
+                evaluator_prompt=evaluator_prompt,
                 default_notify=False,
             )
+
             if should_notify:
                 logger.info("Heartbeat: completed, delivering response")
                 await _deliver_to_channel(
@@ -2169,7 +2177,7 @@ def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
     session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
-    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
 ):
