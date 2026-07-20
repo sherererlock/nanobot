@@ -480,18 +480,25 @@ def test_config_dump_excludes_oauth_provider_blocks():
 
 
 def test_plugins_list_uses_explicit_config(monkeypatch, tmp_path: Path):
+    from nanobot.channels.plugin import ChannelPlugin
+
     config_path = tmp_path / "config.json"
     config_path.write_text(
         json.dumps({"channels": {"example": {"enabled": True}}}),
         encoding="utf-8",
     )
-    monkeypatch.setattr(
-        "nanobot.channels.registry.discover_channel_names",
-        lambda: ["example"],
+    plugin = ChannelPlugin(
+        name="example",
+        display_name="Example",
+        runtime="example.runtime:ExampleChannel",
     )
     monkeypatch.setattr(
         "nanobot.channels.registry.discover_plugins",
-        lambda: {},
+        lambda enabled_names=None: (
+            {"example": plugin}
+            if enabled_names is None or "example" in enabled_names
+            else {}
+        ),
     )
     monkeypatch.setattr(
         "nanobot.optional_features.optional_dependency_groups",
@@ -2750,6 +2757,9 @@ def test_gateway_local_trigger_queue_submits_agent_turns(
         def __init__(self, *_args, **_kwargs) -> None:
             return None
 
+        def get_channel(self, name: str) -> object | None:
+            return object() if name == "websocket" else None
+
         async def start_all(self) -> None:
             await asyncio.Event().wait()
 
@@ -2776,6 +2786,8 @@ def test_gateway_local_trigger_queue_submits_agent_turns(
     assert kwargs["store"] is agent_kwargs["local_trigger_store"]
     assert "bus" not in kwargs
     assert kwargs["submit_turn"] is agent.submit_local_trigger_turn
+    assert kwargs["is_channel_enabled"]("websocket") is True
+    assert kwargs["is_channel_enabled"]("telegram") is False
 
 
 def test_gateway_workspace_override_does_not_migrate_legacy_cron(
